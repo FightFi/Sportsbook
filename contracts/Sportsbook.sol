@@ -40,20 +40,14 @@ contract Sportsbook is
     // Role definitions
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
+    // Constants
+    uint256 public constant CLAIM_WINDOW = 72 hours; // Claim window duration
+    uint256 private constant POINTS_WINNER_ONLY = 3; // Points for correct winner only
+    uint256 private constant POINTS_WINNER_AND_METHOD = 4; // Points for correct winner and method
+    uint256 private constant PERCENTAGE_BASE = 100; // Base for percentage calculations (100 = 100%)
+
     // State variables
     address public fpContract; // FP1155 contract address
-    uint256 public constant CLAIM_WINDOW = 72 hours; // Claim window duration
-
-    // Season and fight configuration
-    mapping(uint256 => Season) public seasons; // seasonId => Season struct
-    mapping(uint256 => mapping(uint256 => FightConfig)) public fights; // seasonId => fightId => FightConfig
-    mapping(uint256 => mapping(uint256 => mapping(uint256 => Pool)))
-        public pools; // seasonId => fightId => outcome => Pool
-    mapping(uint256 => mapping(uint256 => FightState)) public fightStates; // seasonId => fightId => FightState
-
-    // Position tracking
-    mapping(address => mapping(uint256 => mapping(uint256 => Position)))
-        public userPositions; // user => seasonId => fightId => Position
 
     // Structs
     struct Season {
@@ -80,14 +74,25 @@ contract Sportsbook is
         uint256 totalWinningsPool; // Total winnings pool (loser stakes + prize pool) - stored to avoid overflow
         uint256 winningPoolTotalShares; // Total shares in winning pool - stored to avoid overflow
     }
+
     struct Pool {
         uint256 totalStaked; // Total FP staked in this pool
     }
+
     struct Position {
         uint256 outcome; // Outcome selected by user
         uint256 stakeAmount; // Amount of FP staked
         bool claimed; // Whether winnings have been claimed
     }
+
+    // Mappings
+    mapping(uint256 => Season) public seasons; // seasonId => Season struct
+    mapping(uint256 => mapping(uint256 => FightConfig)) public fights; // seasonId => fightId => FightConfig
+    mapping(uint256 => mapping(uint256 => mapping(uint256 => Pool)))
+        public pools; // seasonId => fightId => outcome => Pool
+    mapping(uint256 => mapping(uint256 => FightState)) public fightStates; // seasonId => fightId => FightState
+    mapping(address => mapping(uint256 => mapping(uint256 => Position)))
+        public userPositions; // user => seasonId => fightId => Position
 
     // Events
     event SeasonCreated(
@@ -154,12 +159,15 @@ contract Sportsbook is
         __ERC1155Holder_init();
 
         require(_fpContract != address(0), "SB-2");
+        require(_admin != address(0), "SB-1");
 
         fpContract = _fpContract;
 
         _grantRole(ADMIN_ROLE, _admin);
         _grantRole(DEFAULT_ADMIN_ROLE, _admin);
     }
+
+    // ============ MAIN FUNCTIONS ============
 
     /// @notice Create a season with all its fights in one transaction
     /// @param seasonId The season ID
@@ -182,11 +190,16 @@ contract Sportsbook is
         // Validate arrays have same length
         require(fightConfigs.length == fightPrizePoolAmounts.length, "SB-12");
         require(fightConfigs.length > 0, "SB-12");
+        // Ensure number of fights doesn't exceed 256 (required for bitmask optimization)
+        require(fightConfigs.length <= 256, "SB-12");
 
-        // Calculate total fight prize pool amount to transfer
+        // Calculate total fight prize pool amount to transfer (unchecked is safe here)
         uint256 totalFightPrizePool = 0;
-        for (uint256 i = 0; i < fightPrizePoolAmounts.length; i++) {
+        for (uint256 i = 0; i < fightPrizePoolAmounts.length; ) {
             totalFightPrizePool += fightPrizePoolAmounts[i];
+            unchecked {
+                ++i;
+            }
         }
 
         // Transfer all fight prize pool tokens at once (if any)
@@ -218,19 +231,23 @@ contract Sportsbook is
 
         // Create all fights and set prize pools
         // Fight IDs are sequential starting from 0 (0, 1, 2, ... n-1)
-        for (uint256 i = 0; i < fightConfigs.length; i++) {
+        // Cache mappings to reduce storage reads
+        mapping(uint256 => FightConfig) storage seasonFights = fights[seasonId];
+        mapping(uint256 => FightState) storage seasonFightStates = fightStates[seasonId];
+        
+        for (uint256 i = 0; i < fightConfigs.length; ) {
             uint256 fightId = i;
             FightConfig calldata cfg = fightConfigs[i];
             uint256 prizePoolAmount = fightPrizePoolAmounts[i];
 
-            require(fights[seasonId][fightId].numOutcomes == 0, "SB-12"); // Fight must not exist
+            require(seasonFights[fightId].numOutcomes == 0, "SB-12"); // Fight must not exist
             require(cfg.minBet > 0 && cfg.maxBet >= cfg.minBet, "SB-16");
             require(cfg.numOutcomes >= 2, "SB-11");
 
-            fights[seasonId][fightId] = cfg;
+            seasonFights[fightId] = cfg;
 
             // Initialize fight state
-            fightStates[seasonId][fightId] = FightState({
+            seasonFightStates[fightId] = FightState({
                 prizePool: prizePoolAmount,
                 fighterAStaked: 0,
                 fighterBStaked: 0,
@@ -240,6 +257,10 @@ contract Sportsbook is
                 totalWinningsPool: 0,
                 winningPoolTotalShares: 0
             });
+
+            unchecked {
+                ++i;
+            }
         }
     }
 
@@ -283,32 +304,44 @@ contract Sportsbook is
         require(fightIds.length == stakes.length, "SB-12");
         require(fightIds.length > 0, "SB-12");
 
-        // Validate fightIds are unique and within valid range
-        for (uint256 i = 0; i < fightIds.length; i++) {
+        // Cache fights mapping to reduce storage reads
+        mapping(uint256 => FightConfig) storage seasonFights = fights[seasonId];
+        mapping(uint256 => FightState) storage seasonFightStates = fightStates[seasonId];
+        mapping(uint256 => Position) storage userSeasonPositions = userPositions[msg.sender][seasonId];
+
+        // Validate fightIds are unique and within valid range (O(n) instead of O(n²))
+        // Use bitmask to track seen fightIds (fights never exceed 256, so bitmask always works)
+        uint256 seenFightIds = 0;
+        for (uint256 i = 0; i < fightIds.length; ) {
             uint256 fightId = fightIds[i];
 
             // Validate fightId is within valid range
             require(fightId < numFights, "SB-12");
 
+            // Check for duplicates using bitmask (O(1) check instead of O(n))
+            // Since fights never exceed 256, bitmask always works
+            uint256 bit = 1 << fightId;
+            require((seenFightIds & bit) == 0, "SB-12"); // Duplicate detected
+            seenFightIds |= bit;
+
             // Validate fight exists (numOutcomes > 0 means fight exists)
-            require(fights[seasonId][fightId].numOutcomes > 0, "SB-12");
+            require(seasonFights[fightId].numOutcomes > 0, "SB-12");
 
             // Validate user doesn't already have a position in this fight
-            require(
-                userPositions[msg.sender][seasonId][fightId].stakeAmount == 0,
-                "SB-23"
-            );
+            require(userSeasonPositions[fightId].stakeAmount == 0, "SB-23");
 
-            // Check for duplicates (fightIds must be unique) - only check forward
-            for (uint256 j = i + 1; j < fightIds.length; j++) {
-                require(fightId != fightIds[j], "SB-12");
+            unchecked {
+                ++i;
             }
         }
 
-        // Calculate total stake amount
+        // Calculate total stake amount (unchecked is safe here as we validate individual stakes)
         uint256 totalStake = 0;
-        for (uint256 i = 0; i < stakes.length; i++) {
+        for (uint256 i = 0; i < stakes.length; ) {
             totalStake += stakes[i];
+            unchecked {
+                ++i;
+            }
         }
 
         // Require at least one bet (totalStake > 0)
@@ -331,12 +364,12 @@ contract Sportsbook is
         );
 
         // Create positions for each specified fight
-        for (uint256 i = 0; i < fightIds.length; i++) {
+        for (uint256 i = 0; i < fightIds.length; ) {
             uint256 fightId = fightIds[i];
             uint256 outcome = outcomes[i];
             uint256 fpStake = stakes[i];
 
-            FightConfig storage config = fights[seasonId][fightId];
+            FightConfig storage config = seasonFights[fightId];
             require(outcome < config.numOutcomes, "SB-11"); // Valid outcome implies fight exists
             require(
                 fpStake >= config.minBet && fpStake <= config.maxBet,
@@ -344,7 +377,7 @@ contract Sportsbook is
             );
 
             // Create position
-            userPositions[msg.sender][seasonId][fightId] = Position({
+            userSeasonPositions[fightId] = Position({
                 outcome: outcome,
                 stakeAmount: fpStake,
                 claimed: false
@@ -356,11 +389,17 @@ contract Sportsbook is
             // Update fighter staked counters and user counters (bit 2: 0 = fighter A, 1 = fighter B)
             uint256 fighter = (outcome >> 2) & 1;
             if (fighter == 0) {
-                fightStates[seasonId][fightId].fighterAStaked += fpStake;
-                fightStates[seasonId][fightId].fighterAUsers += 1; // Increment user count for fighter A
+                seasonFightStates[fightId].fighterAStaked += fpStake;
+                // Increment user count for fighter A (unchecked is safe as it's a counter)
+                unchecked {
+                    seasonFightStates[fightId].fighterAUsers += 1;
+                }
             } else {
-                fightStates[seasonId][fightId].fighterBStaked += fpStake;
-                fightStates[seasonId][fightId].fighterBUsers += 1; // Increment user count for fighter B
+                seasonFightStates[fightId].fighterBStaked += fpStake;
+                // Increment user count for fighter B (unchecked is safe as it's a counter)
+                unchecked {
+                    seasonFightStates[fightId].fighterBUsers += 1;
+                }
             }
 
             emit PredictionLocked(
@@ -370,6 +409,10 @@ contract Sportsbook is
                 outcome,
                 fpStake
             );
+
+            unchecked {
+                ++i;
+            }
         }
     }
 
@@ -392,14 +435,19 @@ contract Sportsbook is
 
         uint256 settlementTime = block.timestamp;
 
+        // Cache mappings to reduce storage reads
+        mapping(uint256 => FightConfig) storage seasonFights = fights[seasonId];
+        mapping(uint256 => FightState) storage seasonFightStates = fightStates[seasonId];
+        mapping(uint256 => mapping(uint256 => Pool)) storage seasonPools = pools[seasonId];
+
         // Resolve each fight (fightIds are sequential: 0, 1, 2, ...)
-        for (uint256 i = 0; i < winningOutcomes.length; i++) {
+        for (uint256 i = 0; i < winningOutcomes.length; ) {
             uint8 winningOutcome = winningOutcomes[i];
             uint256 fightId = i;
 
             // Cache config and fightState to reduce storage reads
-            FightConfig storage config = fights[seasonId][fightId];
-            FightState storage fightState = fightStates[seasonId][fightId];
+            FightConfig storage config = seasonFights[fightId];
+            FightState storage fightState = seasonFightStates[fightId];
             uint256 numOutcomes = config.numOutcomes;
             
             require(winningOutcome < numOutcomes, "SB-11"); // Valid outcome implies fight exists
@@ -414,23 +462,27 @@ contract Sportsbook is
             //   - 4 shares per stake if outcome matches exactly (same winner + same method)
             //   - 3 shares per stake if only winner matches (same winner, different method)
             uint256 winningPoolTotalShares = 0;
+            mapping(uint256 => Pool) storage fightPools = seasonPools[fightId];
 
-            for (uint256 j = 0; j < numOutcomes; j++) {
-                uint256 outcomeStaked = pools[seasonId][fightId][j].totalStaked;
+            for (uint256 j = 0; j < numOutcomes; ) {
+                uint256 outcomeStaked = fightPools[j].totalStaked;
                 
                 // Skip if no stakes in this outcome
-                if (outcomeStaked == 0) continue;
-
-                // Check if this outcome is a winning outcome (same winner)
-                // winningFighterIndex: 0 = fighterA won, 1 = fighterB won
-                uint256 outcomeWinner = (j >> 2) & 1;
-                if (outcomeWinner == winningFighterIndex) {
-                    // Calculate shares for this outcome:
-                    // - 4 shares per stake if method matches exactly (same winner + same method)
-                    // - 3 shares per stake if only winner matches (same winner, different method)
-                    uint256 outcomeMethod = j & 0x3;
-                    uint256 sharesPerStake = (outcomeMethod == winningMethod) ? 4 : 3;
-                    winningPoolTotalShares += outcomeStaked * sharesPerStake;
+                if (outcomeStaked != 0) {
+                    // Check if this outcome is a winning outcome (same winner)
+                    // winningFighterIndex: 0 = fighterA won, 1 = fighterB won
+                    uint256 outcomeWinner = (j >> 2) & 1;
+                    if (outcomeWinner == winningFighterIndex) {
+                        // Calculate shares for this outcome:
+                        // - POINTS_WINNER_AND_METHOD shares per stake if method matches exactly (same winner + same method)
+                        // - POINTS_WINNER_ONLY shares per stake if only winner matches (same winner, different method)
+                        uint256 outcomeMethod = j & 0x3;
+                        uint256 sharesPerStake = (outcomeMethod == winningMethod) ? POINTS_WINNER_AND_METHOD : POINTS_WINNER_ONLY;
+                        winningPoolTotalShares += outcomeStaked * sharesPerStake;
+                    }
+                }
+                unchecked {
+                    ++j;
                 }
             }
 
@@ -462,6 +514,10 @@ contract Sportsbook is
             fightState.winningOutcome = uint256(winningOutcome);
 
             emit FightResolved(seasonId, fightId, winningOutcome);
+
+            unchecked {
+                ++i;
+            }
         }
 
         // Mark season as resolved (all fights resolved together)
@@ -489,25 +545,34 @@ contract Sportsbook is
         require(numFights > 0, "SB-12");
 
         uint256 totalPayoutAmount = 0;
-        uint256 claimedCount = 0;
+
+        // Cache mappings to reduce storage reads
+        mapping(uint256 => Position) storage userSeasonPositions = userPositions[msg.sender][seasonId];
+        mapping(uint256 => FightState) storage seasonFightStates = fightStates[seasonId];
 
         // Process each fight in the season (fight IDs are 0, 1, 2, ... numFights-1)
-        for (uint256 fightId = 0; fightId < numFights; fightId++) {
-            Position storage position = userPositions[msg.sender][seasonId][fightId];
+        for (uint256 fightId = 0; fightId < numFights; ) {
+            Position storage position = userSeasonPositions[fightId];
 
             // Skip if position doesn't exist or already claimed
             uint256 stakeAmount = position.stakeAmount;
             if (stakeAmount == 0 || position.claimed) {
+                unchecked {
+                    ++fightId;
+                }
                 continue;
             }
 
             // Cache fightState to reduce storage reads
-            FightState storage fightState = fightStates[seasonId][fightId];
+            FightState storage fightState = seasonFightStates[fightId];
             
             // Check if fight is settled (totalWinningsPool > 0 means fight is resolved)
             uint256 totalWinningsPool = fightState.totalWinningsPool;
             uint256 winningPoolTotalShares = fightState.winningPoolTotalShares;
             if (totalWinningsPool == 0 || winningPoolTotalShares == 0) {
+                unchecked {
+                    ++fightId;
+                }
                 continue;
             }
 
@@ -521,12 +586,18 @@ contract Sportsbook is
 
             // Skip if user didn't pick the correct winner
             if (userWinner != winningFighterIndex) {
+                unchecked {
+                    ++fightId;
+                }
                 continue;
             }
 
             // Calculate user's points from outcome (3 for winner, 4 for winner + method)
             uint256 userPoints = calculatePoints(userOutcome, fightWinningOutcome);
             if (userPoints == 0) {
+                unchecked {
+                    ++fightId;
+                }
                 continue;
             }
 
@@ -541,13 +612,15 @@ contract Sportsbook is
 
             // Add to total payout
             totalPayoutAmount += fightPayout;
-            claimedCount++;
 
             emit Claimed(msg.sender, seasonId, fightId, fightPayout);
+
+            unchecked {
+                ++fightId;
+            }
         }
 
         // Require at least one position was claimed
-        require(claimedCount > 0, "SB-11");
         require(totalPayoutAmount > 0, "SB-11");
 
         // Transfer total FP tokens to user in a single transaction
@@ -558,6 +631,30 @@ contract Sportsbook is
             totalPayoutAmount,
             ""
         );
+    }
+
+    // ============ UTILITY FUNCTIONS ============
+
+    /// @notice Calculate points for a position based on outcome matching
+    /// @dev Points system: 3 points for correct winner, +1 point for correct method = 4 total
+    /// @dev Outcome encoding: bits 0-1 = method (0=Submission, 1=Decision, 2=KO/TKO), bit 2 = winner (0=A, 1=B)
+    /// @param userOutcome The outcome selected by the user
+    /// @param winningOutcome The winning outcome
+    /// @return points Points earned (3 for winner only, 4 for winner + method)
+    function calculatePoints(
+        uint256 userOutcome,
+        uint256 winningOutcome
+    ) public pure returns (uint256 points) {
+        // Extract winner (bit 2) and method (bits 0-1)
+        uint256 userWinner = (userOutcome >> 2) & 1;
+        uint256 winningFighterIndex = (winningOutcome >> 2) & 1;
+        uint256 userMethod = userOutcome & 0x3;
+        uint256 winningMethod = winningOutcome & 0x3;
+
+        // Points: POINTS_WINNER_ONLY for correct winner, POINTS_WINNER_AND_METHOD for winner + method, 0 if wrong winner
+        points = (userWinner == winningFighterIndex)
+            ? ((userMethod == winningMethod) ? POINTS_WINNER_AND_METHOD : POINTS_WINNER_ONLY)
+            : 0;
     }
 
     // ============ VIEW FUNCTIONS ============
@@ -596,10 +693,13 @@ contract Sportsbook is
         outcomes = new uint256[](numOutcomes);
         totalStakedArray = new uint256[](numOutcomes);
 
-        for (uint256 i = 0; i < numOutcomes; i++) {
+        for (uint256 i = 0; i < numOutcomes; ) {
             Pool storage pool = pools[seasonId][fightId][i];
             outcomes[i] = i;
             totalStakedArray[i] = pool.totalStaked;
+            unchecked {
+                ++i;
+            }
         }
     }
 
@@ -637,8 +737,8 @@ contract Sportsbook is
     /// @return fighterAStaked Total amount staked on fighter A
     /// @return fighterBStaked Total amount staked on fighter B
     /// @return totalUsers Total number of users who bet on this fight
-    /// @return fighterAProbability Percentage of users who bet on fighter A (0-10000, where 10000 = 100%)
-    /// @return fighterBProbability Percentage of users who bet on fighter B (0-10000, where 10000 = 100%)
+    /// @return fighterAProbability Percentage of users who bet on fighter A (0-100, where 100 = 100%)
+    /// @return fighterBProbability Percentage of users who bet on fighter B (0-100, where 100 = 100%)
     function getFightStatistics(
         uint256 seasonId,
         uint256 fightId
@@ -663,10 +763,10 @@ contract Sportsbook is
         fighterBStaked = fightState.fighterBStaked;
         totalUsers = fighterAUsers + fighterBUsers;
         
-        // Calculate probabilities based on user count (0-10000, where 10000 = 100%)
+        // Calculate probabilities based on user count (0-100, where 100 = 100%)
         if (totalUsers > 0) {
-            fighterAProbability = (fighterAUsers * 10000) / totalUsers;
-            fighterBProbability = (fighterBUsers * 10000) / totalUsers;
+            fighterAProbability = (fighterAUsers * PERCENTAGE_BASE) / totalUsers;
+            fighterBProbability = (fighterBUsers * PERCENTAGE_BASE) / totalUsers;
         } else {
             fighterAProbability = 0;
             fighterBProbability = 0;
@@ -794,12 +894,15 @@ contract Sportsbook is
         uint256 seasonId
     ) external view returns (uint256 totalPoints) {
         uint256 numFights = seasons[seasonId].numFights;
-        for (uint256 i = 0; i < numFights; i++) {
+        for (uint256 i = 0; i < numFights; ) {
             Position storage pos = userPositions[user][seasonId][i];
             uint256 stakeAmount = pos.stakeAmount;
             
             // Skip if no position
             if (stakeAmount == 0) {
+                unchecked {
+                    ++i;
+                }
                 continue;
             }
 
@@ -813,6 +916,10 @@ contract Sportsbook is
                 uint256 fightWinningOutcome = fightState.winningOutcome;
                 uint256 points = calculatePoints(pos.outcome, fightWinningOutcome);
                 totalPoints += points;
+            }
+
+            unchecked {
+                ++i;
             }
         }
     }
@@ -838,12 +945,15 @@ contract Sportsbook is
         )
     {
         uint256 numFights = seasons[seasonId].numFights;
-        for (uint256 i = 0; i < numFights; i++) {
+        for (uint256 i = 0; i < numFights; ) {
             Position storage pos = userPositions[user][seasonId][i];
             uint256 stakeAmount = pos.stakeAmount;
             
             // Skip if no position
             if (stakeAmount == 0) {
+                unchecked {
+                    ++i;
+                }
                 continue;
             }
 
@@ -861,37 +971,23 @@ contract Sportsbook is
             
             totalPoints += points;
             if (points > 0) {
-                positionsWithPoints++;
-                if (points == 3) {
-                    positionsWith3Points++;
-                } else if (points == 4) {
-                    positionsWith4Points++;
+                unchecked {
+                    positionsWithPoints++;
+                    if (points == POINTS_WINNER_ONLY) {
+                        positionsWith3Points++;
+                    } else if (points == POINTS_WINNER_AND_METHOD) {
+                        positionsWith4Points++;
+                    }
                 }
+            }
+
+            unchecked {
+                ++i;
             }
         }
     }
 
-    /// @notice Calculate points for a position based on outcome matching
-    /// @dev Points system: 3 points for correct winner, +1 point for correct method = 4 total
-    /// @dev Outcome encoding: bits 0-1 = method (0=Submission, 1=Decision, 2=KO/TKO), bit 2 = winner (0=A, 1=B)
-    /// @param userOutcome The outcome selected by the user
-    /// @param winningOutcome The winning outcome
-    /// @return points Points earned (3 for winner only, 4 for winner + method)
-    function calculatePoints(
-        uint256 userOutcome,
-        uint256 winningOutcome
-    ) public pure returns (uint256 points) {
-        // Extract winner (bit 2) and method (bits 0-1)
-        uint256 userWinner = (userOutcome >> 2) & 1;
-        uint256 winningFighterIndex = (winningOutcome >> 2) & 1;
-        uint256 userMethod = userOutcome & 0x3;
-        uint256 winningMethod = winningOutcome & 0x3;
-
-        // 3 points if correct winner, +1 if also correct method, 0 if wrong winner
-        points = (userWinner == winningFighterIndex)
-            ? ((userMethod == winningMethod) ? 4 : 3)
-            : 0;
-    }
+    // ============ PRIZE POOL FUNCTIONS ============
 
     /// @notice Seed prize pool for a fight
     /// @dev Can only be called by ADMIN_ROLE
@@ -904,6 +1000,7 @@ contract Sportsbook is
         uint256 fpAmount
     ) external onlyRole(ADMIN_ROLE) {
         require(seasons[seasonId].cutOffTime > 0, "SB-12");
+        require(!seasons[seasonId].resolved, "SB-9");
         require(fpAmount > 0, "SB-17");
 
         uint256 seasonTokenId = seasons[seasonId].seasonTokenId;
@@ -957,17 +1054,20 @@ contract Sportsbook is
         uint256 winningPoolTotalShares = 0;
         uint256 totalLoserStakes = 0;
         
-        for (uint256 j = 0; j < config.numOutcomes; j++) {
+        for (uint256 j = 0; j < config.numOutcomes; ) {
             uint256 outcomeStaked = pools[seasonId][fightId][j].totalStaked;
-            if (outcomeStaked == 0) continue;
-            
-            uint256 outcomeWinner = (j >> 2) & 1;
-            if (outcomeWinner == winningFighterIndex) {
-                uint256 outcomeMethod = j & 0x3;
-                uint256 sharesPerStake = (outcomeMethod == winningMethod) ? 4 : 3;
-                winningPoolTotalShares += outcomeStaked * sharesPerStake;
-            } else {
-                totalLoserStakes += outcomeStaked;
+            if (outcomeStaked != 0) {
+                uint256 outcomeWinner = (j >> 2) & 1;
+                if (outcomeWinner == winningFighterIndex) {
+                    uint256 outcomeMethod = j & 0x3;
+                    uint256 sharesPerStake = (outcomeMethod == winningMethod) ? POINTS_WINNER_AND_METHOD : POINTS_WINNER_ONLY;
+                    winningPoolTotalShares += outcomeStaked * sharesPerStake;
+                } else {
+                    totalLoserStakes += outcomeStaked;
+                }
+            }
+            unchecked {
+                ++j;
             }
         }
         
@@ -991,17 +1091,20 @@ contract Sportsbook is
         
         // Find minimum shares per stake in winning outcomes
         uint256 minSharesPerStake = type(uint256).max;
-        for (uint256 j = 0; j < config.numOutcomes; j++) {
+        for (uint256 j = 0; j < config.numOutcomes; ) {
             uint256 outcomeStaked = pools[seasonId][fightId][j].totalStaked;
-            if (outcomeStaked == 0) continue;
-            
-            uint256 outcomeWinner = (j >> 2) & 1;
-            if (outcomeWinner == winningFighterIndex) {
-                uint256 outcomeMethod = j & 0x3;
-                uint256 sharesPerStake = (outcomeMethod == winningMethod) ? 4 : 3;
-                if (sharesPerStake < minSharesPerStake) {
-                    minSharesPerStake = sharesPerStake;
+            if (outcomeStaked != 0) {
+                uint256 outcomeWinner = (j >> 2) & 1;
+                if (outcomeWinner == winningFighterIndex) {
+                    uint256 outcomeMethod = j & 0x3;
+                    uint256 sharesPerStake = (outcomeMethod == winningMethod) ? POINTS_WINNER_AND_METHOD : POINTS_WINNER_ONLY;
+                    if (sharesPerStake < minSharesPerStake) {
+                        minSharesPerStake = sharesPerStake;
+                    }
                 }
+            }
+            unchecked {
+                ++j;
             }
         }
         
@@ -1065,9 +1168,12 @@ contract Sportsbook is
         estimatedWinnersArray = new uint256[](numFights);
         
         // Calculate for each fight
-        for (uint256 i = 0; i < numFights; i++) {
+        for (uint256 i = 0; i < numFights; ) {
             (requiredPrizePools[i], currentPrizePools[i], additionalSeedsNeeded[i], estimatedWinnersArray[i]) = 
                 _calculateRequiredSeedForFight(seasonId, i, winningOutcomes[i]);
+            unchecked {
+                ++i;
+            }
         }
         
         return (requiredPrizePools, currentPrizePools, additionalSeedsNeeded, estimatedWinnersArray);
@@ -1093,20 +1199,21 @@ contract Sportsbook is
         uint256 seasonTokenId = seasons[seasonId].seasonTokenId;
         require(seasonTokenId > 0, "SB-12");
         
-        // Initialize arrays
-        uint256[] memory requiredPrizePools = new uint256[](numFights);
-        uint256[] memory currentPrizePools = new uint256[](numFights);
+        // Initialize array for additional seeds needed
         uint256[] memory additionalSeedsNeeded = new uint256[](numFights);
-        uint256[] memory estimatedWinnersArray = new uint256[](numFights);
         
         uint256 totalAdditionalSeed = 0;
         
-        // Calculate for each fight using internal function
-        for (uint256 i = 0; i < numFights; i++) {
-            (requiredPrizePools[i], currentPrizePools[i], additionalSeedsNeeded[i], estimatedWinnersArray[i]) = 
+        // Calculate for each fight using internal function (only need additionalSeedsNeeded)
+        for (uint256 i = 0; i < numFights; ) {
+            (, , additionalSeedsNeeded[i], ) = 
                 _calculateRequiredSeedForFight(seasonId, i, winningOutcomes[i]);
             
             totalAdditionalSeed += additionalSeedsNeeded[i];
+
+            unchecked {
+                ++i;
+            }
         }
         
         if (autoSeed && totalAdditionalSeed > 0) {
@@ -1120,14 +1227,19 @@ contract Sportsbook is
             );
             
             // Distribute to each fight
-            for (uint256 i = 0; i < numFights; i++) {
+            for (uint256 i = 0; i < numFights; ) {
                 if (additionalSeedsNeeded[i] > 0) {
                     fightStates[seasonId][i].prizePool += additionalSeedsNeeded[i];
                     emit PrizePoolSeeded(seasonId, i, additionalSeedsNeeded[i]);
                 }
+                unchecked {
+                    ++i;
+                }
             }
         }
     }
+
+    // ============ ADMIN FUNCTIONS ============
 
     /// @notice Recover remaining balance after claim window expires
     /// @dev Can only be called by ADMIN_ROLE after claim window expires
@@ -1184,11 +1296,13 @@ contract Sportsbook is
         emit FPContractUpdated(oldContract, _fpContract);
     }
 
+    // ============ UPGRADE FUNCTIONS ============
+
     /// @notice Authorize upgrade
     function _authorizeUpgrade(
         address newImplementation
     ) internal view override onlyRole(ADMIN_ROLE) {
-        require(newImplementation != address(0));
+        require(newImplementation != address(0), "SB-2");
     }
 
     /// @notice Check if contract supports interface
