@@ -525,7 +525,7 @@ describe("Sportsbook", function () {
     expect(await fp1155.balanceOf(admin.address, seasonTokenId)).to.equal(amount);
   });
 
-  it.only("Single fight analysis: Fight 0 only", async function () {
+  it("Single fight analysis: Fight 0 only", async function () {
     const { fp1155, sportsbook, admin, users } = await setupContracts();
     const [user1, user2, user3] = users;
     const sportsbookAddress = await sportsbook.getAddress();
@@ -798,7 +798,7 @@ describe("Sportsbook", function () {
     expect(claimed3After).to.be.true;
   });
   
-  it("Complete flow: Create season, predictions, resolution and payouts", async function () {
+  it.only("Complete flow: Create season, predictions, resolution and payouts", async function () {
     const { fp1155, sportsbook, admin, users } = await setupContracts();
     const [user1, user2, user3] = users;
     const sportsbookAddress = await sportsbook.getAddress();
@@ -954,19 +954,231 @@ describe("Sportsbook", function () {
    
     // ============ STEP 4: Users claim winnings ============
   
-    // User1 should have winnings from Fight 0, 1, and 2
+    // Get detailed winnings for each user before claims
+    console.log("\n=== DETAILED WINNINGS BREAKDOWN BEFORE CLAIMS ===");
+    
+    // User1: Should have winnings from Fight 0, 1, and 2
+    const user1Claimable = await getTotalClaimable(sportsbook, user1.address, seasonId, 5);
+    console.log(`\n--- User1 Detailed Breakdown ---`);
+    let user1TotalWinnings = 0n;
+    let user1TotalStake = 0n;
+    for (const fight of user1Claimable.breakdown) {
+      if (fight.canClaim && !fight.claimed) {
+        user1TotalWinnings += fight.winnings;
+        user1TotalStake += fight.totalPayout - fight.winnings;
+        console.log(`  Fight ${fight.fightId}: ${formatFP(fight.winnings)} winnings + ${formatFP(fight.totalPayout - fight.winnings)} stake = ${formatFP(fight.totalPayout)} total (${fight.points} points)`);
+      }
+    }
+    
+    // User2: Should have winnings from Fight 0 (winner only, 3 shares)
+    const user2Claimable = await getTotalClaimable(sportsbook, user2.address, seasonId, 5);
+    console.log(`\n--- User2 Detailed Breakdown ---`);
+    let user2TotalWinnings = 0n;
+    let user2TotalStake = 0n;
+    for (const fight of user2Claimable.breakdown) {
+      if (fight.canClaim && !fight.claimed) {
+        user2TotalWinnings += fight.winnings;
+        user2TotalStake += fight.totalPayout - fight.winnings;
+        console.log(`  Fight ${fight.fightId}: ${formatFP(fight.winnings)} winnings + ${formatFP(fight.totalPayout - fight.winnings)} stake = ${formatFP(fight.totalPayout)} total (${fight.points} points)`);
+      }
+    }
+    
+    // User3: Should have winnings from Fight 0, 3, and 4
+    const user3Claimable = await getTotalClaimable(sportsbook, user3.address, seasonId, 5);
+    console.log(`\n--- User3 Detailed Breakdown ---`);
+    let user3TotalWinnings = 0n;
+    let user3TotalStake = 0n;
+    for (const fight of user3Claimable.breakdown) {
+      if (fight.canClaim && !fight.claimed) {
+        user3TotalWinnings += fight.winnings;
+        user3TotalStake += fight.totalPayout - fight.winnings;
+        console.log(`  Fight ${fight.fightId}: ${formatFP(fight.winnings)} winnings + ${formatFP(fight.totalPayout - fight.winnings)} stake = ${formatFP(fight.totalPayout)} total (${fight.points} points)`);
+      }
+    }
+    
+    // Visualize detailed fight data for each fight before claims
+    console.log("\n=== DETAILED FIGHT ANALYSIS BEFORE CLAIMS ===");
+    for (let fightId = 0; fightId < 5; fightId++) {
+      await visualizeFightDetails(sportsbook, seasonId, fightId);
+    }
+    
+    // User1 claim
+    console.log("\n=== USER1 CLAIM ===");
     const balanceBefore1 = await fp1155.balanceOf(user1.address, seasonTokenId);
     const contractBalanceBeforeClaim1 = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+    
+    // Get position winnings for each fight User1 won
+    const [canClaim1_0, userPoints1_0, userWinnings1_0, totalPayout1_0, claimed1_0] = 
+      await sportsbook.getPositionWinnings(user1.address, seasonId, 0);
+    const [canClaim1_1, userPoints1_1, userWinnings1_1, totalPayout1_1, claimed1_1] = 
+      await sportsbook.getPositionWinnings(user1.address, seasonId, 1);
+    const [canClaim1_2, userPoints1_2, userWinnings1_2, totalPayout1_2, claimed1_2] = 
+      await sportsbook.getPositionWinnings(user1.address, seasonId, 2);
+    
+    const position1_0 = await sportsbook.getPosition(user1.address, seasonId, 0);
+    const position1_1 = await sportsbook.getPosition(user1.address, seasonId, 1);
+    const position1_2 = await sportsbook.getPosition(user1.address, seasonId, 2);
+    
+    console.log(`Before claim - Balance: ${formatFP(balanceBefore1)}`);
+    console.log(`Fight 0: ${formatFP(userWinnings1_0)} winnings + ${formatFP(position1_0.stakeAmount)} stake = ${formatFP(totalPayout1_0)} total (${userPoints1_0} points)`);
+    console.log(`Fight 1: ${formatFP(userWinnings1_1)} winnings + ${formatFP(position1_1.stakeAmount)} stake = ${formatFP(totalPayout1_1)} total (${userPoints1_1} points)`);
+    console.log(`Fight 2: ${formatFP(userWinnings1_2)} winnings + ${formatFP(position1_2.stakeAmount)} stake = ${formatFP(totalPayout1_2)} total (${userPoints1_2} points)`);
+    const expectedTotalPayout1 = totalPayout1_0 + totalPayout1_1 + totalPayout1_2;
+    console.log(`Expected total payout: ${formatFP(expectedTotalPayout1)}`);
+    
     await expect(sportsbook.connect(user1).claim(seasonId))
       .to.emit(sportsbook, "Claimed");
+    
     const balanceAfter1 = await fp1155.balanceOf(user1.address, seasonTokenId);
     const contractBalanceAfterClaim1 = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
     const winnings1 = balanceAfter1 - balanceBefore1;
     const contractPayout1 = contractBalanceBeforeClaim1 - contractBalanceAfterClaim1;
-    console.log(`User1 balance after claim: ${formatFP(balanceAfter1)}`);
-    console.log(`User1 winnings: ${formatFP(winnings1)}`);
-    console.log(`Sportsbook contract balance after User1 claim: ${formatFP(contractBalanceAfterClaim1)} (paid out: ${formatFP(contractPayout1)})`);
-    expect(balanceAfter1).to.be.gt(balanceBefore1);
+    
+    console.log(`After claim - Balance: ${formatFP(balanceAfter1)}`);
+    console.log(`Winnings received: ${formatFP(winnings1)}`);
+    console.log(`Contract balance after claim: ${formatFP(contractBalanceAfterClaim1)} (paid out: ${formatFP(contractPayout1)})`);
+    expect(balanceAfter1).to.equal(balanceBefore1 + expectedTotalPayout1);
+    expect(contractBalanceAfterClaim1).to.equal(contractBalanceBeforeClaim1 - expectedTotalPayout1);
+    
+    // User2 claim
+    console.log("\n=== USER2 CLAIM ===");
+    const balanceBefore2 = await fp1155.balanceOf(user2.address, seasonTokenId);
+    const contractBalanceBeforeClaim2 = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+    
+    // Get position winnings for Fight 0 (User2 only won Fight 0)
+    const [canClaim2_0, userPoints2_0, userWinnings2_0, totalPayout2_0, claimed2_0] = 
+      await sportsbook.getPositionWinnings(user2.address, seasonId, 0);
+    
+    const position2_0 = await sportsbook.getPosition(user2.address, seasonId, 0);
+    
+    console.log(`Before claim - Balance: ${formatFP(balanceBefore2)}`);
+    console.log(`Fight 0: ${formatFP(userWinnings2_0)} winnings + ${formatFP(position2_0.stakeAmount)} stake = ${formatFP(totalPayout2_0)} total (${userPoints2_0} points)`);
+    console.log(`Fight 1: Lost (wrong fighter)`);
+    console.log(`Expected total payout: ${formatFP(totalPayout2_0)}`);
+    
+    await expect(sportsbook.connect(user2).claim(seasonId))
+      .to.emit(sportsbook, "Claimed");
+    
+    const balanceAfter2 = await fp1155.balanceOf(user2.address, seasonTokenId);
+    const contractBalanceAfterClaim2 = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+    const winnings2 = balanceAfter2 - balanceBefore2;
+    const contractPayout2 = contractBalanceBeforeClaim2 - contractBalanceAfterClaim2;
+    
+    console.log(`After claim - Balance: ${formatFP(balanceAfter2)}`);
+    console.log(`Winnings received: ${formatFP(winnings2)}`);
+    console.log(`Contract balance after claim: ${formatFP(contractBalanceAfterClaim2)} (paid out: ${formatFP(contractPayout2)})`);
+    expect(balanceAfter2).to.equal(balanceBefore2 + totalPayout2_0);
+    expect(contractBalanceAfterClaim2).to.equal(contractBalanceBeforeClaim2 - totalPayout2_0);
+    
+    // User3 claim
+    console.log("\n=== USER3 CLAIM ===");
+    const balanceBefore3 = await fp1155.balanceOf(user3.address, seasonTokenId);
+    const contractBalanceBeforeClaim3 = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+    
+    // Get position winnings for each fight User3 won
+    const [canClaim3_0, userPoints3_0, userWinnings3_0, totalPayout3_0, claimed3_0] = 
+      await sportsbook.getPositionWinnings(user3.address, seasonId, 0);
+    const [canClaim3_3, userPoints3_3, userWinnings3_3, totalPayout3_3, claimed3_3] = 
+      await sportsbook.getPositionWinnings(user3.address, seasonId, 3);
+    const [canClaim3_4, userPoints3_4, userWinnings3_4, totalPayout3_4, claimed3_4] = 
+      await sportsbook.getPositionWinnings(user3.address, seasonId, 4);
+    
+    const position3_0 = await sportsbook.getPosition(user3.address, seasonId, 0);
+    const position3_3 = await sportsbook.getPosition(user3.address, seasonId, 3);
+    const position3_4 = await sportsbook.getPosition(user3.address, seasonId, 4);
+    
+    console.log(`Before claim - Balance: ${formatFP(balanceBefore3)}`);
+    console.log(`Fight 0: ${formatFP(userWinnings3_0)} winnings + ${formatFP(position3_0.stakeAmount)} stake = ${formatFP(totalPayout3_0)} total (${userPoints3_0} points)`);
+    console.log(`Fight 3: ${formatFP(userWinnings3_3)} winnings + ${formatFP(position3_3.stakeAmount)} stake = ${formatFP(totalPayout3_3)} total (${userPoints3_3} points)`);
+    console.log(`Fight 4: ${formatFP(userWinnings3_4)} winnings + ${formatFP(position3_4.stakeAmount)} stake = ${formatFP(totalPayout3_4)} total (${userPoints3_4} points)`);
+    const expectedTotalPayout3 = totalPayout3_0 + totalPayout3_3 + totalPayout3_4;
+    console.log(`Expected total payout: ${formatFP(expectedTotalPayout3)}`);
+    
+    await expect(sportsbook.connect(user3).claim(seasonId))
+      .to.emit(sportsbook, "Claimed");
+    
+    const balanceAfter3 = await fp1155.balanceOf(user3.address, seasonTokenId);
+    const contractBalanceAfterClaim3 = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+    const winnings3 = balanceAfter3 - balanceBefore3;
+    const contractPayout3 = contractBalanceBeforeClaim3 - contractBalanceAfterClaim3;
+    
+    console.log(`After claim - Balance: ${formatFP(balanceAfter3)}`);
+    console.log(`Winnings received: ${formatFP(winnings3)}`);
+    console.log(`Contract balance after claim: ${formatFP(contractBalanceAfterClaim3)} (paid out: ${formatFP(contractPayout3)})`);
+    expect(balanceAfter3).to.equal(balanceBefore3 + expectedTotalPayout3);
+    expect(contractBalanceAfterClaim3).to.equal(contractBalanceBeforeClaim3 - expectedTotalPayout3);
+    
+    // ============ STEP 5: Final Summary ============
+    console.log("\n=== FINAL RESULTS SUMMARY ===");
+    
+    // Calculate totals
+    const totalWinningsPaid = userWinnings1_0 + userWinnings1_1 + userWinnings1_2 + 
+                              userWinnings2_0 + 
+                              userWinnings3_0 + userWinnings3_3 + userWinnings3_4;
+    
+    const totalStakesRecovered = position1_0.stakeAmount + position1_1.stakeAmount + position1_2.stakeAmount +
+                                 position2_0.stakeAmount +
+                                 position3_0.stakeAmount + position3_3.stakeAmount + position3_4.stakeAmount;
+    
+    const totalPayout = totalWinningsPaid + totalStakesRecovered;
+    
+    // Calculate total stakes placed (all users, all fights)
+    const totalStakesPlaced = 60n + 60n + 75n; // User1: 60, User2: 60, User3: 75
+    
+    // Calculate remainder (prize pool + stakes - payouts)
+    const expectedRemainder = (totalPrizePool + totalStakesPlaced) - totalPayout;
+    
+    console.log(`\n--- User1 Results ---`);
+    console.log(`  Fight 0: ${formatFP(userWinnings1_0)} winnings + ${formatFP(position1_0.stakeAmount)} stake = ${formatFP(totalPayout1_0)} total`);
+    console.log(`  Fight 1: ${formatFP(userWinnings1_1)} winnings + ${formatFP(position1_1.stakeAmount)} stake = ${formatFP(totalPayout1_1)} total`);
+    console.log(`  Fight 2: ${formatFP(userWinnings1_2)} winnings + ${formatFP(position1_2.stakeAmount)} stake = ${formatFP(totalPayout1_2)} total`);
+    console.log(`  Total: ${formatFP(userWinnings1_0 + userWinnings1_1 + userWinnings1_2)} winnings + ${formatFP(position1_0.stakeAmount + position1_1.stakeAmount + position1_2.stakeAmount)} stake = ${formatFP(expectedTotalPayout1)} total`);
+    
+    console.log(`\n--- User2 Results ---`);
+    console.log(`  Fight 0: ${formatFP(userWinnings2_0)} winnings + ${formatFP(position2_0.stakeAmount)} stake = ${formatFP(totalPayout2_0)} total`);
+    console.log(`  Fight 1: Lost (wrong fighter)`);
+    console.log(`  Total: ${formatFP(userWinnings2_0)} winnings + ${formatFP(position2_0.stakeAmount)} stake = ${formatFP(totalPayout2_0)} total`);
+    
+    console.log(`\n--- User3 Results ---`);
+    console.log(`  Fight 0: ${formatFP(userWinnings3_0)} winnings + ${formatFP(position3_0.stakeAmount)} stake = ${formatFP(totalPayout3_0)} total`);
+    console.log(`  Fight 3: ${formatFP(userWinnings3_3)} winnings + ${formatFP(position3_3.stakeAmount)} stake = ${formatFP(totalPayout3_3)} total`);
+    console.log(`  Fight 4: ${formatFP(userWinnings3_4)} winnings + ${formatFP(position3_4.stakeAmount)} stake = ${formatFP(totalPayout3_4)} total`);
+    console.log(`  Total: ${formatFP(userWinnings3_0 + userWinnings3_3 + userWinnings3_4)} winnings + ${formatFP(position3_0.stakeAmount + position3_3.stakeAmount + position3_4.stakeAmount)} stake = ${formatFP(expectedTotalPayout3)} total`);
+    
+    console.log(`\n--- Overall Summary ---`);
+    console.log(`  Total Winnings Paid: ${formatFP(totalWinningsPaid)}`);
+    console.log(`  Total Stakes Recovered: ${formatFP(totalStakesRecovered)}`);
+    console.log(`  Total Payout: ${formatFP(totalPayout)}`);
+    console.log(`  Total Stakes Placed: ${formatFP(totalStakesPlaced)}`);
+    console.log(`  Total Prize Pool: ${formatFP(totalPrizePool)}`);
+    console.log(`  Total in Contract (before payouts): ${formatFP(totalPrizePool + totalStakesPlaced)}`);
+    console.log(`  Remainder in Contract: ${formatFP(expectedRemainder)} (truncation remainder)`);
+    console.log(`  Final Contract Balance: ${formatFP(contractBalanceAfterClaim3)}`);
+    
+    // Verify final balances
+    expect(contractBalanceAfterClaim3).to.equal(expectedRemainder);
+    
+    // Verify all positions are claimed
+    const [canClaim1_0After, , , , claimed1_0After] = await sportsbook.getPositionWinnings(user1.address, seasonId, 0);
+    const [canClaim1_1After, , , , claimed1_1After] = await sportsbook.getPositionWinnings(user1.address, seasonId, 1);
+    const [canClaim1_2After, , , , claimed1_2After] = await sportsbook.getPositionWinnings(user1.address, seasonId, 2);
+    const [canClaim2_0After, , , , claimed2_0After] = await sportsbook.getPositionWinnings(user2.address, seasonId, 0);
+    const [canClaim3_0After, , , , claimed3_0After] = await sportsbook.getPositionWinnings(user3.address, seasonId, 0);
+    const [canClaim3_3After, , , , claimed3_3After] = await sportsbook.getPositionWinnings(user3.address, seasonId, 3);
+    const [canClaim3_4After, , , , claimed3_4After] = await sportsbook.getPositionWinnings(user3.address, seasonId, 4);
+    
+    expect(claimed1_0After).to.be.true;
+    expect(claimed1_1After).to.be.true;
+    expect(claimed1_2After).to.be.true;
+    expect(claimed2_0After).to.be.true;
+    expect(claimed3_0After).to.be.true;
+    expect(claimed3_3After).to.be.true;
+    expect(claimed3_4After).to.be.true;
+    
+    // Visualize final state
+    console.log("\n=== FINAL STATE VISUALIZATION ===");
+    await visualizeFights(sportsbook, seasonId, 5);
+    await visualizeUserBets(sportsbook, seasonId, [user1, user2, user3], ["User1", "User2", "User3"], 5);
  
   });
 
