@@ -457,6 +457,24 @@ contract Sportsbook is
             uint256 winningFighterIndex = (winningOutcome >> 2) & 1;
             uint256 winningMethod = winningOutcome & 0x3;
 
+            // Special handling for No-Contest (method = 3)
+            // No-Contest: All users get refund (stake only), no points, no winnings
+            if (winningMethod == 3) {
+                // For No-Contest, set special values to indicate refund-only resolution
+                // totalWinningsPool = 0 means no winnings pool (refund only)
+                // winningPoolTotalShares = 0 means no shares calculation needed
+                fightState.totalWinningsPool = 0;
+                fightState.winningPoolTotalShares = 0;
+                fightState.winningOutcome = uint256(winningOutcome);
+                
+                emit FightResolved(seasonId, fightId, winningOutcome);
+                
+                unchecked {
+                    ++i;
+                }
+                continue;
+            }
+
             // Calculate total weighted shares for winning outcomes
             // winningPoolTotalShares: Total weighted shares in winning pool (denominator for FP payout calculation)
             //   - 4 shares per stake if outcome matches exactly (same winner + same method)
@@ -566,6 +584,27 @@ contract Sportsbook is
             // Cache fightState to reduce storage reads
             FightState storage fightState = seasonFightStates[fightId];
             
+            // Get winning outcome for this fight
+            uint256 fightWinningOutcome = fightState.winningOutcome;
+            uint256 winningMethod = fightWinningOutcome & 0x3;
+            
+            // Special handling for No-Contest (method = 3): All users get refund (stake only)
+            if (winningMethod == 3) {
+                // For No-Contest, all users who bet get their stake back (refund only)
+                // Mark position as claimed
+                position.claimed = true;
+                
+                // Add to total payout (only stake, no winnings)
+                totalPayoutAmount += stakeAmount;
+                
+                emit Claimed(msg.sender, seasonId, fightId, stakeAmount);
+                
+                unchecked {
+                    ++fightId;
+                }
+                continue;
+            }
+            
             // Check if fight is settled (totalWinningsPool > 0 means fight is resolved)
             uint256 totalWinningsPool = fightState.totalWinningsPool;
             uint256 winningPoolTotalShares = fightState.winningPoolTotalShares;
@@ -575,9 +614,6 @@ contract Sportsbook is
                 }
                 continue;
             }
-
-            // Get winning outcome for this fight
-            uint256 fightWinningOutcome = fightState.winningOutcome;
 
             // Check if user's outcome matches the winner (bit 2)
             uint256 userOutcome = position.outcome;
@@ -650,6 +686,11 @@ contract Sportsbook is
         uint256 winningFighterIndex = (winningOutcome >> 2) & 1;
         uint256 userMethod = userOutcome & 0x3;
         uint256 winningMethod = winningOutcome & 0x3;
+
+        // Special case: No-Contest (method = 3) gives 0 points (refund only)
+        if (winningMethod == 3) {
+            return 0;
+        }
 
         // Points: POINTS_WINNER_ONLY for correct winner, POINTS_WINNER_AND_METHOD for winner + method, 0 if wrong winner
         points = (userWinner == winningFighterIndex)
@@ -820,6 +861,17 @@ contract Sportsbook is
 
         // Cache fightState to reduce storage reads
         FightState storage fightState = fightStates[seasonId][fightId];
+        
+        // Get winning outcome for this fight
+        uint256 fightWinningOutcome = fightState.winningOutcome;
+        uint256 winningMethod = fightWinningOutcome & 0x3;
+        
+        // Special handling for No-Contest (method = 3): All users get refund (stake only)
+        if (winningMethod == 3) {
+            // For No-Contest, all users who bet get their stake back (refund only)
+            return (true, 0, 0, stakeAmount, claimed);
+        }
+        
         uint256 totalWinningsPool = fightState.totalWinningsPool;
         uint256 winningPoolTotalShares = fightState.winningPoolTotalShares;
         
@@ -827,9 +879,6 @@ contract Sportsbook is
         if (totalWinningsPool == 0 || winningPoolTotalShares == 0) {
             return (false, 0, 0, 0, claimed);
         }
-
-        // Get winning outcome for this fight
-        uint256 fightWinningOutcome = fightState.winningOutcome;
 
         // Check if user's outcome matches the winner (bit 2)
         uint256 userOutcome = position.outcome;

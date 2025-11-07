@@ -14,11 +14,20 @@ async function deployFP1155(adminAddress: string) {
 }
 
 // Helper function to decode outcome
+// Outcome encoding: bits 0-1 = method (0-3), bit 2 = winner (0=RED, 1=BLUE)
+// Methods: 0 = Submission, 1 = Decision, 2 = KO/TKO, 3 = No-Contest
+// NOTE: No-Contest is a special case - if the winning outcome is No-Contest, all users
+// should receive only their stake back (refund), with 0 points and 0 winnings.
+// This requires special handling in the contract (not currently implemented).
 function decodeOutcome(outcome: bigint): { fighter: string; method: string } {
   const fighter = (outcome >> 2n) & 1n;
   const method = outcome & 3n;
-  const fighterName = fighter === 0n ? "Fighter A" : "Fighter B";
-  const methodName = method === 0n ? "Submission" : method === 1n ? "Decision" : "KO/TKO";
+  const fighterName = fighter === 0n ? "RED" : "BLUE";
+  const methodName = 
+    method === 0n ? "Submission" : 
+    method === 1n ? "Decision" : 
+    method === 2n ? "KO/TKO" : 
+    "No-Contest";
   return { fighter: fighterName, method: methodName };
 }
 
@@ -1740,6 +1749,274 @@ describe("Sportsbook", function () {
     });
   });
 
+  describe("No-Contest Handling", function () {
+    it.only("Should refund all users when fight result is No-Contest", async function () {
+      const { fp1155, sportsbook, admin, users } = await setupContracts();
+      const [user1, user2, user3] = users;
+      const sportsbookAddress = await sportsbook.getAddress();
+      const TRANSFER_AGENT_ROLE = await fp1155.TRANSFER_AGENT_ROLE();
+      expect(await fp1155.hasRole(TRANSFER_AGENT_ROLE, sportsbookAddress)).to.be.true;
+
+      console.log("\n=== TEST: No-Contest Refund ===");
+
+      // ============ STEP 1: Create Season with 1 fight ============
+      const seasonId = 200n;
+      const seasonTokenId = 1n;
+      const latestBlock = await ethers.provider.getBlock("latest");
+      const cutOffTime = BigInt(latestBlock!.timestamp) + 86400n; // 1 day from now
+
+      // 1 fight with 8 outcomes (RED/BLUE x 4 methods: Submission, Decision, KO/TKO, No-Contest)
+      const fightConfigs = [{
+        minBet: 1n,
+        maxBet: 1000n,
+        numOutcomes: 8,
+      }];
+
+      // Prize pool: 1000 FP
+      const fightPrizePoolAmounts = [1000n];
+      const totalPrizePool = 1000n;
+
+      // Mint FP tokens to admin for prize pool
+      await fp1155.mint(admin.address, seasonTokenId, totalPrizePool, "0x");
+      await fp1155.setTransferAllowlist(admin.address, true);
+      await fp1155.connect(admin).setApprovalForAll(await sportsbook.getAddress(), true);
+
+      await sportsbook.createSeasonWithFights(
+        seasonId,
+        cutOffTime,
+        seasonTokenId,
+        fightConfigs,
+        fightPrizePoolAmounts
+      );
+
+      // ============ STEP 2: Users make predictions ============
+      const userBalance = 1000n;
+      await fp1155.mint(user1.address, seasonTokenId, userBalance, "0x");
+      await fp1155.mint(user2.address, seasonTokenId, userBalance, "0x");
+      await fp1155.mint(user3.address, seasonTokenId, userBalance, "0x");
+
+      await fp1155.setTransferAllowlist(user1.address, true);
+      await fp1155.setTransferAllowlist(user2.address, true);
+      await fp1155.setTransferAllowlist(user3.address, true);
+
+      await fp1155.connect(user1).setApprovalForAll(await sportsbook.getAddress(), true);
+      await fp1155.connect(user2).setApprovalForAll(await sportsbook.getAddress(), true);
+      await fp1155.connect(user3).setApprovalForAll(await sportsbook.getAddress(), true);
+
+      // User1: Bets 100 FP on outcome 0 (RED - Submission)
+      // User2: Bets 200 FP on outcome 1 (RED - Decision)
+      // User3: Bets 150 FP on outcome 4 (BLUE - Submission)
+      const stake1 = 100n;
+      const stake2 = 200n;
+      const stake3 = 150n;
+
+      await sportsbook.connect(user1).lockPredictionsBatch(seasonId, [0n], [0n], [stake1]);
+      await sportsbook.connect(user2).lockPredictionsBatch(seasonId, [0n], [1n], [stake2]);
+      await sportsbook.connect(user3).lockPredictionsBatch(seasonId, [0n], [4n], [stake3]);
+
+      const totalStaked = stake1 + stake2 + stake3;
+      const contractBalanceAfterPredictions = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+      expect(contractBalanceAfterPredictions).to.equal(totalPrizePool + totalStaked);
+
+      console.log(`\nPredictions made:`);
+      console.log(`  User1: ${formatFP(stake1)} on outcome 0 (RED - Submission)`);
+      console.log(`  User2: ${formatFP(stake2)} on outcome 1 (RED - Decision)`);
+      console.log(`  User3: ${formatFP(stake3)} on outcome 4 (BLUE - Submission)`);
+      console.log(`  Total staked: ${formatFP(totalStaked)}`);
+      console.log(`  Prize pool: ${formatFP(totalPrizePool)}`);
+      console.log(`  Contract balance: ${formatFP(contractBalanceAfterPredictions)}`);
+
+      // ============ STEP 3: Resolve with No-Contest ============
+      // No-Contest outcomes: 3 (RED - No-Contest) or 7 (BLUE - No-Contest)
+      // We'll use outcome 3 (RED - No-Contest)
+      const winningOutcome = 3n; // RED - No-Contest (method = 3)
+      const winningOutcomes = [3];
+
+      console.log(`\nResolving fight with No-Contest (outcome ${winningOutcome} = RED - No-Contest)...`);
+
+      await sportsbook.connect(admin).resolveSeason(seasonId, winningOutcomes);
+
+      // Verify fight state
+      const fightState = await sportsbook.fightStates(seasonId, 0n);
+      expect(fightState.winningOutcome).to.equal(winningOutcome);
+      // For No-Contest, totalWinningsPool and winningPoolTotalShares should be 0
+      expect(fightState.totalWinningsPool).to.equal(0n);
+      expect(fightState.winningPoolTotalShares).to.equal(0n);
+
+      console.log(`✓ Fight resolved as No-Contest`);
+      console.log(`  Winning outcome: ${fightState.winningOutcome} (RED - No-Contest)`);
+      console.log(`  Total winnings pool: ${formatFP(fightState.totalWinningsPool)} (should be 0)`);
+      console.log(`  Winning pool total shares: ${formatFP(fightState.winningPoolTotalShares)} (should be 0)`);
+
+      // ============ STEP 4: Verify all users can claim (refund only) ============
+      console.log(`\nVerifying claimable amounts for all users...`);
+
+      // User1: Should get refund (stake only), 0 points, 0 winnings
+      const [canClaim1, userPoints1, userWinnings1, totalPayout1, claimed1] = 
+        await sportsbook.getPositionWinnings(user1.address, seasonId, 0);
+      
+      expect(canClaim1).to.be.true; // Can claim (refund)
+      expect(userPoints1).to.equal(0n); // 0 points for No-Contest
+      expect(userWinnings1).to.equal(0n); // 0 winnings for No-Contest
+      expect(totalPayout1).to.equal(stake1); // Only stake refund
+      expect(claimed1).to.be.false;
+
+      console.log(`  User1: canClaim=${canClaim1}, points=${userPoints1}, winnings=${formatFP(userWinnings1)}, totalPayout=${formatFP(totalPayout1)}`);
+
+      // User2: Should get refund (stake only), 0 points, 0 winnings
+      const [canClaim2, userPoints2, userWinnings2, totalPayout2, claimed2] = 
+        await sportsbook.getPositionWinnings(user2.address, seasonId, 0);
+      
+      expect(canClaim2).to.be.true; // Can claim (refund)
+      expect(userPoints2).to.equal(0n); // 0 points for No-Contest
+      expect(userWinnings2).to.equal(0n); // 0 winnings for No-Contest
+      expect(totalPayout2).to.equal(stake2); // Only stake refund
+      expect(claimed2).to.be.false;
+
+      console.log(`  User2: canClaim=${canClaim2}, points=${userPoints2}, winnings=${formatFP(userWinnings2)}, totalPayout=${formatFP(totalPayout2)}`);
+
+      // User3: Should get refund (stake only), 0 points, 0 winnings
+      const [canClaim3, userPoints3, userWinnings3, totalPayout3, claimed3] = 
+        await sportsbook.getPositionWinnings(user3.address, seasonId, 0);
+      
+      expect(canClaim3).to.be.true; // Can claim (refund)
+      expect(userPoints3).to.equal(0n); // 0 points for No-Contest
+      expect(userWinnings3).to.equal(0n); // 0 winnings for No-Contest
+      expect(totalPayout3).to.equal(stake3); // Only stake refund
+      expect(claimed3).to.be.false;
+
+      console.log(`  User3: canClaim=${canClaim3}, points=${userPoints3}, winnings=${formatFP(userWinnings3)}, totalPayout=${formatFP(totalPayout3)}`);
+
+      // ============ STEP 5: Users claim refunds ============
+      console.log(`\nUsers claiming refunds...`);
+
+      const contractBalanceBeforeClaims = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+
+      // User1 claims
+      const balanceBefore1 = await fp1155.balanceOf(user1.address, seasonTokenId);
+      await sportsbook.connect(user1).claim(seasonId);
+      const balanceAfter1 = await fp1155.balanceOf(user1.address, seasonTokenId);
+      const refund1 = balanceAfter1 - balanceBefore1;
+      expect(refund1).to.equal(stake1);
+
+      console.log(`  User1 claimed: ${formatFP(refund1)} (expected: ${formatFP(stake1)})`);
+
+      // User2 claims
+      const balanceBefore2 = await fp1155.balanceOf(user2.address, seasonTokenId);
+      await sportsbook.connect(user2).claim(seasonId);
+      const balanceAfter2 = await fp1155.balanceOf(user2.address, seasonTokenId);
+      const refund2 = balanceAfter2 - balanceBefore2;
+      expect(refund2).to.equal(stake2);
+
+      console.log(`  User2 claimed: ${formatFP(refund2)} (expected: ${formatFP(stake2)})`);
+
+      // User3 claims
+      const balanceBefore3 = await fp1155.balanceOf(user3.address, seasonTokenId);
+      await sportsbook.connect(user3).claim(seasonId);
+      const balanceAfter3 = await fp1155.balanceOf(user3.address, seasonTokenId);
+      const refund3 = balanceAfter3 - balanceBefore3;
+      expect(refund3).to.equal(stake3);
+
+      console.log(`  User3 claimed: ${formatFP(refund3)} (expected: ${formatFP(stake3)})`);
+
+      // ============ STEP 6: Verify final balances ============
+      const contractBalanceAfterClaims = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+      const totalRefunded = refund1 + refund2 + refund3;
+      const expectedRemainingBalance = contractBalanceBeforeClaims - totalRefunded;
+
+      expect(contractBalanceAfterClaims).to.equal(expectedRemainingBalance);
+      // Remaining balance should be the prize pool (not distributed)
+      expect(contractBalanceAfterClaims).to.equal(totalPrizePool);
+
+      console.log(`\n=== FINAL BALANCES ===`);
+      console.log(`  Total refunded: ${formatFP(totalRefunded)}`);
+      console.log(`  Contract balance after claims: ${formatFP(contractBalanceAfterClaims)}`);
+      console.log(`  Expected remaining (prize pool): ${formatFP(totalPrizePool)}`);
+      console.log(`✓ All users received refund (stake only)`);
+      console.log(`✓ Prize pool remains in contract (not distributed)`);
+      console.log(`✓ No points awarded (0 points for all users)`);
+      console.log(`✓ No winnings paid (0 winnings for all users)`);
+
+      // Verify positions are marked as claimed
+      const [, , , , claimed1After] = await sportsbook.getPositionWinnings(user1.address, seasonId, 0);
+      const [, , , , claimed2After] = await sportsbook.getPositionWinnings(user2.address, seasonId, 0);
+      const [, , , , claimed3After] = await sportsbook.getPositionWinnings(user3.address, seasonId, 0);
+
+      expect(claimed1After).to.be.true;
+      expect(claimed2After).to.be.true;
+      expect(claimed3After).to.be.true;
+
+      console.log(`✓ All positions marked as claimed`);
+
+      // ============ STEP 7: Test recoverRemainingBalance ============
+      console.log(`\n=== TEST: Recover Remaining Balance ===`);
+
+      // Get settlement time from season
+      const season = await sportsbook.seasons(seasonId);
+      const settlementTime = season.settlementTime;
+      expect(settlementTime).to.be.gt(0n);
+
+      // Get CLAIM_WINDOW constant (72 hours = 259200 seconds)
+      const CLAIM_WINDOW = await sportsbook.CLAIM_WINDOW();
+      const claimWindowSeconds = Number(CLAIM_WINDOW);
+      
+      // Get current block timestamp
+      const currentBlock = await ethers.provider.getBlock("latest");
+      const currentTime = BigInt(currentBlock!.timestamp);
+      
+      // Calculate time needed to advance (CLAIM_WINDOW + 1 second to expire)
+      const timeToAdvance = Number(settlementTime + CLAIM_WINDOW + 1n - currentTime);
+      
+      console.log(`  Settlement time: ${settlementTime}`);
+      console.log(`  Current time: ${currentTime}`);
+      console.log(`  Claim window: ${claimWindowSeconds} seconds (72 hours)`);
+      console.log(`  Time to advance: ${timeToAdvance} seconds`);
+
+      // Advance time to expire claim window
+      if (timeToAdvance > 0) {
+        await ethers.provider.send("evm_increaseTime", [timeToAdvance]);
+        await ethers.provider.send("evm_mine", []);
+      }
+
+      // Verify claim window has expired
+      const blockAfterTimeAdvance = await ethers.provider.getBlock("latest");
+      const timeAfterAdvance = BigInt(blockAfterTimeAdvance!.timestamp);
+      expect(timeAfterAdvance).to.be.gt(settlementTime + CLAIM_WINDOW);
+      
+      console.log(`  Time after advance: ${timeAfterAdvance}`);
+      console.log(`  ✓ Claim window expired`);
+
+      // Get remaining balance before recovery
+      const remainingBalanceBefore = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+      expect(remainingBalanceBefore).to.equal(totalPrizePool); // Should be the prize pool (1000 FP)
+      
+      console.log(`  Remaining balance in contract: ${formatFP(remainingBalanceBefore)}`);
+
+      // Get admin balance before recovery
+      const adminBalanceBefore = await fp1155.balanceOf(admin.address, seasonTokenId);
+
+      // Recover remaining balance
+      await sportsbook.connect(admin).recoverRemainingBalance(seasonId, admin.address);
+
+      // Verify balance was transferred to admin
+      const adminBalanceAfter = await fp1155.balanceOf(admin.address, seasonTokenId);
+      const recoveredAmount = adminBalanceAfter - adminBalanceBefore;
+      expect(recoveredAmount).to.equal(remainingBalanceBefore);
+      
+      console.log(`  Admin balance before: ${formatFP(adminBalanceBefore)}`);
+      console.log(`  Admin balance after: ${formatFP(adminBalanceAfter)}`);
+      console.log(`  Recovered amount: ${formatFP(recoveredAmount)}`);
+
+      // Verify contract balance is now 0
+      const remainingBalanceAfter = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+      expect(remainingBalanceAfter).to.equal(0n);
+      
+      console.log(`  Contract balance after recovery: ${formatFP(remainingBalanceAfter)}`);
+      console.log(`✓ Remaining balance recovered successfully`);
+      console.log(`✓ Contract balance is now 0`);
+    });
+  });
+
   describe.skip("Stress Test: 15 Fights with 10,000 Users", function () {
     it.skip("Should handle 15 fights with 10,000 users making predictions", async function () {
       const { fp1155, sportsbook, admin, users } = await setupContracts();
@@ -1755,11 +2032,14 @@ describe("Sportsbook", function () {
       const latestBlock = await ethers.provider.getBlock("latest");
       const cutOffTime = BigInt(latestBlock!.timestamp) + 86400n; // 1 day from now
       
-      // 15 fights, each with 6 outcomes (Fighter A/B x 3 methods)
+      // 15 fights, each with 8 outcomes (RED/BLUE x 4 methods: Submission, Decision, KO/TKO, No-Contest)
+      // NOTE: No-Contest (method = 3) is a special case - if the winning outcome is No-Contest,
+      // all users should receive only their stake back (refund), with 0 points and 0 winnings.
+      // This requires special handling in the contract (not currently implemented).
       const fightConfigs = Array(15).fill({
         minBet: 1n,
         maxBet: 1000n,
-        numOutcomes: 6,
+        numOutcomes: 8,
       });
       
       // Prize pool: 10,000 FP per fight = 150,000 FP total (minimum 10k per fight)
@@ -1915,8 +2195,8 @@ describe("Sportsbook", function () {
           const stakes: bigint[] = [];
           
           for (const fightId of fightIds) {
-            // Random outcome (0-5)
-            const outcome = BigInt(globalIndex % 6);
+            // Random outcome (0-7): 8 outcomes (2 fighters x 4 methods)
+            const outcome = BigInt(globalIndex % 8);
             outcomes.push(outcome);
             
             // Random stake (1-100 FP)
@@ -1963,7 +2243,7 @@ describe("Sportsbook", function () {
         totalFighterAStaked += fightState.fighterAStaked;
         totalFighterBStaked += fightState.fighterBStaked;
         if (fightId < 3 || fightId === 14) {
-          console.log(`  Fight ${fightId}: Fighter A: ${formatFP(fightState.fighterAStaked)}, Fighter B: ${formatFP(fightState.fighterBStaked)}`);
+          console.log(`  Fight ${fightId}: RED: ${formatFP(fightState.fighterAStaked)}, BLUE: ${formatFP(fightState.fighterBStaked)}`);
         }
       }
       
@@ -1973,8 +2253,8 @@ describe("Sportsbook", function () {
       console.log(`  Contract balance: ${formatFP(contractBalanceAfterPredictions)}`);
       console.log(`  Expected balance: ${formatFP(expectedContractBalance)} (prize pool: ${formatFP(totalPrizePool)} + stakes: ${formatFP(totalStaked)})`);
       console.log(`  Total staked across all fights: ${formatFP(totalStaked)}`);
-      console.log(`  Total Fighter A staked: ${formatFP(totalFighterAStaked)}`);
-      console.log(`  Total Fighter B staked: ${formatFP(totalFighterBStaked)}`);
+      console.log(`  Total RED staked: ${formatFP(totalFighterAStaked)}`);
+      console.log(`  Total BLUE staked: ${formatFP(totalFighterBStaked)}`);
       console.log(`✓ Contract state and balance verified (integrity check passed)`);
       
       // Verify sample user balances decreased correctly
@@ -1995,8 +2275,8 @@ describe("Sportsbook", function () {
       
       // ============ STEP 6: Resolve Season ============
       console.log(`\nResolving season...`);
-      // Winning outcomes: random but consistent
-      const winningOutcomes = [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2];
+      // Winning outcomes: random but consistent (0-7 for 8 outcomes)
+      const winningOutcomes = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6];
       
       // Store contract balance before resolution
       const contractBalanceBeforeResolution = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
@@ -2331,15 +2611,15 @@ describe("Sportsbook", function () {
       expect(season.numFights).to.equal(15n);
       
       // Verify all fights are resolved
-      // Note: winningOutcome can be 0 (Fighter A - Submission), so we check totalWinningsPool instead
+      // Note: winningOutcome can be 0 (RED - Submission), so we check totalWinningsPool instead
       for (let fightId = 0; fightId < 15; fightId++) {
         const fightState = await sportsbook.fightStates(seasonId, BigInt(fightId));
-        // winningOutcome can be 0 (Fighter A - Submission), so we verify resolution by checking totalWinningsPool
+        // winningOutcome can be 0 (RED - Submission), so we verify resolution by checking totalWinningsPool
         // If totalWinningsPool > 0, the fight is resolved (even if winningOutcome is 0)
         expect(fightState.totalWinningsPool).to.be.gt(0n);
         expect(fightState.winningPoolTotalShares).to.be.gt(0n);
-        // Verify winningOutcome is within valid range (0-5 for 6 outcomes)
-        expect(fightState.winningOutcome).to.be.lte(5n);
+        // Verify winningOutcome is within valid range (0-7 for 8 outcomes: 2 fighters x 4 methods)
+        expect(fightState.winningOutcome).to.be.lte(7n);
       }
       console.log(`✓ All 15 fights resolved correctly`);
       
