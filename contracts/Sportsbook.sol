@@ -74,6 +74,8 @@ contract Sportsbook is
         uint256 prizePool; // Fight-level prize pool amount in FP
         uint256 fighterAStaked; // Total staked for fighter A
         uint256 fighterBStaked; // Total staked for fighter B
+        uint256 fighterAUsers; // Number of users who bet on fighter A
+        uint256 fighterBUsers; // Number of users who bet on fighter B
         uint256 winningOutcome; // Winning outcome (0 if not resolved)
         uint256 totalWinningsPool; // Total winnings pool (loser stakes + prize pool) - stored to avoid overflow
         uint256 winningPoolTotalShares; // Total shares in winning pool - stored to avoid overflow
@@ -232,6 +234,8 @@ contract Sportsbook is
                 prizePool: prizePoolAmount,
                 fighterAStaked: 0,
                 fighterBStaked: 0,
+                fighterAUsers: 0,
+                fighterBUsers: 0,
                 winningOutcome: 0,
                 totalWinningsPool: 0,
                 winningPoolTotalShares: 0
@@ -349,12 +353,14 @@ contract Sportsbook is
             // Add stake to outcome pool
             pools[seasonId][fightId][outcome].totalStaked += fpStake;
 
-            // Update fighter staked counters (bit 2: 0 = fighter A, 1 = fighter B)
+            // Update fighter staked counters and user counters (bit 2: 0 = fighter A, 1 = fighter B)
             uint256 fighter = (outcome >> 2) & 1;
             if (fighter == 0) {
                 fightStates[seasonId][fightId].fighterAStaked += fpStake;
+                fightStates[seasonId][fightId].fighterAUsers += 1; // Increment user count for fighter A
             } else {
                 fightStates[seasonId][fightId].fighterBStaked += fpStake;
+                fightStates[seasonId][fightId].fighterBUsers += 1; // Increment user count for fighter B
             }
 
             emit PredictionLocked(
@@ -623,6 +629,60 @@ contract Sportsbook is
         );
     }
 
+    /// @notice Get fight statistics including user counts and probabilities
+    /// @param seasonId The season ID
+    /// @param fightId The fight ID
+    /// @return fighterAUsers Number of users who bet on fighter A
+    /// @return fighterBUsers Number of users who bet on fighter B
+    /// @return fighterAStaked Total amount staked on fighter A
+    /// @return fighterBStaked Total amount staked on fighter B
+    /// @return totalUsers Total number of users who bet on this fight
+    /// @return fighterAProbability Percentage of users who bet on fighter A (0-10000, where 10000 = 100%)
+    /// @return fighterBProbability Percentage of users who bet on fighter B (0-10000, where 10000 = 100%)
+    function getFightStatistics(
+        uint256 seasonId,
+        uint256 fightId
+    )
+        external
+        view
+        returns (
+            uint256 fighterAUsers,
+            uint256 fighterBUsers,
+            uint256 fighterAStaked,
+            uint256 fighterBStaked,
+            uint256 totalUsers,
+            uint256 fighterAProbability,
+            uint256 fighterBProbability
+        )
+    {
+        FightState storage fightState = fightStates[seasonId][fightId];
+        
+        fighterAUsers = fightState.fighterAUsers;
+        fighterBUsers = fightState.fighterBUsers;
+        fighterAStaked = fightState.fighterAStaked;
+        fighterBStaked = fightState.fighterBStaked;
+        totalUsers = fighterAUsers + fighterBUsers;
+        
+        // Calculate probabilities based on user count (0-10000, where 10000 = 100%)
+        if (totalUsers > 0) {
+            fighterAProbability = (fighterAUsers * 10000) / totalUsers;
+            fighterBProbability = (fighterBUsers * 10000) / totalUsers;
+        } else {
+            fighterAProbability = 0;
+            fighterBProbability = 0;
+        }
+        
+        return (
+            fighterAUsers,
+            fighterBUsers,
+            fighterAStaked,
+            fighterBStaked,
+            totalUsers,
+            fighterAProbability,
+            fighterBProbability
+        );
+    }
+
     /// @notice Calculate winnings for a position (if resolved and winner is correct)
     /// @param user The user address
     /// @param seasonId The season ID
@@ -861,6 +921,212 @@ contract Sportsbook is
         fightStates[seasonId][fightId].prizePool += fpAmount;
 
         emit PrizePoolSeeded(seasonId, fightId, fpAmount);
+    }
+
+    /// @notice Internal function to calculate required seed for a single fight
+    /// @param seasonId The season ID
+    /// @param fightId The fight ID
+    /// @param winningOutcome The expected winning outcome
+    /// @return requiredPrizePool The minimum prize pool required
+    /// @return currentPrizePool The current prize pool
+    /// @return additionalSeedNeeded The additional seed needed
+    /// @return estimatedWinners The estimated number of winners
+    function _calculateRequiredSeedForFight(
+        uint256 seasonId,
+        uint256 fightId,
+        uint8 winningOutcome
+    ) internal view returns (
+        uint256 requiredPrizePool,
+        uint256 currentPrizePool,
+        uint256 additionalSeedNeeded,
+        uint256 estimatedWinners
+    ) {
+        FightConfig storage config = fights[seasonId][fightId];
+        FightState storage fightState = fightStates[seasonId][fightId];
+        
+        require(config.numOutcomes > 0, "SB-12"); // Fight must exist
+        require(winningOutcome < config.numOutcomes, "SB-11");
+        
+        currentPrizePool = fightState.prizePool;
+        
+        // Extract winning fighter index
+        uint256 winningFighterIndex = (winningOutcome >> 2) & 1;
+        uint256 winningMethod = winningOutcome & 0x3;
+        
+        // Calculate winning pool total shares
+        uint256 winningPoolTotalShares = 0;
+        uint256 totalLoserStakes = 0;
+        
+        for (uint256 j = 0; j < config.numOutcomes; j++) {
+            uint256 outcomeStaked = pools[seasonId][fightId][j].totalStaked;
+            if (outcomeStaked == 0) continue;
+            
+            uint256 outcomeWinner = (j >> 2) & 1;
+            if (outcomeWinner == winningFighterIndex) {
+                uint256 outcomeMethod = j & 0x3;
+                uint256 sharesPerStake = (outcomeMethod == winningMethod) ? 4 : 3;
+                winningPoolTotalShares += outcomeStaked * sharesPerStake;
+            } else {
+                totalLoserStakes += outcomeStaked;
+            }
+        }
+        
+        // Get actual number of winning users from fight state
+        uint256 winningUsers = (winningFighterIndex == 0) 
+            ? fightState.fighterAUsers 
+            : fightState.fighterBUsers;
+        
+        estimatedWinners = winningUsers;
+        
+        // If no winners, return 0
+        if (winningPoolTotalShares == 0 || winningUsers == 0) {
+            return (0, currentPrizePool, 0, 0);
+        }
+        
+        // Calculate required total winnings pool
+        // We need to ensure that each winning user gets at least 1 FP
+        // Formula: userWinnings = (totalWinningsPool * userShares) / winningPoolTotalShares >= 1
+        // For the worst case (user with minimum shares), we need:
+        // totalWinningsPool * minSharesPerUser >= winningPoolTotalShares
+        
+        // Find minimum shares per stake in winning outcomes
+        uint256 minSharesPerStake = type(uint256).max;
+        for (uint256 j = 0; j < config.numOutcomes; j++) {
+            uint256 outcomeStaked = pools[seasonId][fightId][j].totalStaked;
+            if (outcomeStaked == 0) continue;
+            
+            uint256 outcomeWinner = (j >> 2) & 1;
+            if (outcomeWinner == winningFighterIndex) {
+                uint256 outcomeMethod = j & 0x3;
+                uint256 sharesPerStake = (outcomeMethod == winningMethod) ? 4 : 3;
+                if (sharesPerStake < minSharesPerStake) {
+                    minSharesPerStake = sharesPerStake;
+                }
+            }
+        }
+        
+        // If we couldn't find any winning outcomes with stakes, return 0
+        if (minSharesPerStake == type(uint256).max) {
+            return (0, currentPrizePool, 0, 0);
+        }
+        
+        // Calculate required total winnings pool
+        // We want: (totalWinningsPool * minSharesPerStake) / winningPoolTotalShares >= 1
+        // So: totalWinningsPool * minSharesPerStake >= winningPoolTotalShares
+        // Therefore: totalWinningsPool >= winningPoolTotalShares / minSharesPerStake
+        // Use ceiling division
+        uint256 requiredTotalWinningsPool = (winningPoolTotalShares + minSharesPerStake - 1) / minSharesPerStake;
+        
+        // Calculate required prize pool
+        if (requiredTotalWinningsPool > totalLoserStakes) {
+            requiredPrizePool = requiredTotalWinningsPool - totalLoserStakes;
+        } else {
+            requiredPrizePool = 0; // Loser stakes are enough
+        }
+        
+        // Calculate additional seed needed
+        if (requiredPrizePool > currentPrizePool) {
+            additionalSeedNeeded = requiredPrizePool - currentPrizePool;
+        } else {
+            additionalSeedNeeded = 0;
+        }
+        
+        return (requiredPrizePool, currentPrizePool, additionalSeedNeeded, estimatedWinners);
+    }
+
+    /// @notice Calculate the minimum prize pool required for all fights in a season
+    /// @dev This is a view function that simulates resolution for all fights
+    /// @param seasonId The season ID
+    /// @param winningOutcomes Array of expected winning outcomes (one per fight)
+    /// @return requiredPrizePools Array of minimum prize pools required per fight
+    /// @return currentPrizePools Array of current prize pools per fight
+    /// @return additionalSeedsNeeded Array of additional seeds needed per fight
+    /// @return estimatedWinnersArray Array of estimated winners per fight
+    function calculateRequiredSeedForSeason(
+        uint256 seasonId,
+        uint8[] calldata winningOutcomes
+    ) external view returns (
+        uint256[] memory requiredPrizePools,
+        uint256[] memory currentPrizePools,
+        uint256[] memory additionalSeedsNeeded,
+        uint256[] memory estimatedWinnersArray
+    ) {
+        require(seasons[seasonId].cutOffTime > 0, "SB-12");
+        require(!seasons[seasonId].resolved, "SB-9");
+        
+        uint256 numFights = seasons[seasonId].numFights;
+        require(numFights > 0, "SB-12");
+        require(winningOutcomes.length == numFights, "SB-12");
+        
+        // Initialize arrays
+        requiredPrizePools = new uint256[](numFights);
+        currentPrizePools = new uint256[](numFights);
+        additionalSeedsNeeded = new uint256[](numFights);
+        estimatedWinnersArray = new uint256[](numFights);
+        
+        // Calculate for each fight
+        for (uint256 i = 0; i < numFights; i++) {
+            (requiredPrizePools[i], currentPrizePools[i], additionalSeedsNeeded[i], estimatedWinnersArray[i]) = 
+                _calculateRequiredSeedForFight(seasonId, i, winningOutcomes[i]);
+        }
+        
+        return (requiredPrizePools, currentPrizePools, additionalSeedsNeeded, estimatedWinnersArray);
+    }
+
+    /// @notice Seed prize pools for all fights in a season with automatic calculation
+    /// @dev Can be called before resolution to ensure all winners get at least 1 FP
+    /// @param seasonId The season ID
+    /// @param winningOutcomes Array of expected winning outcomes (one per fight)
+    /// @param autoSeed If true, automatically seed the required amounts
+    function seedPrizePoolsForSeason(
+        uint256 seasonId,
+        uint8[] calldata winningOutcomes,
+        bool autoSeed
+    ) external onlyRole(ADMIN_ROLE) {
+        require(seasons[seasonId].cutOffTime > 0, "SB-12");
+        require(!seasons[seasonId].resolved, "SB-9");
+        
+        uint256 numFights = seasons[seasonId].numFights;
+        require(numFights > 0, "SB-12");
+        require(winningOutcomes.length == numFights, "SB-12");
+        
+        uint256 seasonTokenId = seasons[seasonId].seasonTokenId;
+        require(seasonTokenId > 0, "SB-12");
+        
+        // Initialize arrays
+        uint256[] memory requiredPrizePools = new uint256[](numFights);
+        uint256[] memory currentPrizePools = new uint256[](numFights);
+        uint256[] memory additionalSeedsNeeded = new uint256[](numFights);
+        uint256[] memory estimatedWinnersArray = new uint256[](numFights);
+        
+        uint256 totalAdditionalSeed = 0;
+        
+        // Calculate for each fight using internal function
+        for (uint256 i = 0; i < numFights; i++) {
+            (requiredPrizePools[i], currentPrizePools[i], additionalSeedsNeeded[i], estimatedWinnersArray[i]) = 
+                _calculateRequiredSeedForFight(seasonId, i, winningOutcomes[i]);
+            
+            totalAdditionalSeed += additionalSeedsNeeded[i];
+        }
+        
+        if (autoSeed && totalAdditionalSeed > 0) {
+            // Transfer all additional FP tokens at once
+            IERC1155(fpContract).safeTransferFrom(
+                msg.sender,
+                address(this),
+                seasonTokenId,
+                totalAdditionalSeed,
+                ""
+            );
+            
+            // Distribute to each fight
+            for (uint256 i = 0; i < numFights; i++) {
+                if (additionalSeedsNeeded[i] > 0) {
+                    fightStates[seasonId][i].prizePool += additionalSeedsNeeded[i];
+                    emit PrizePoolSeeded(seasonId, i, additionalSeedsNeeded[i]);
+                }
+            }
+        }
     }
 
     /// @notice Recover remaining balance after claim window expires

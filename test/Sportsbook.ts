@@ -798,7 +798,7 @@ describe("Sportsbook", function () {
     expect(claimed3After).to.be.true;
   });
   
-  it.only("Complete flow: Create season, predictions, resolution and payouts", async function () {
+  it("Complete flow: Create season, predictions, resolution and payouts", async function () {
     const { fp1155, sportsbook, admin, users } = await setupContracts();
     const [user1, user2, user3] = users;
     const sportsbookAddress = await sportsbook.getAddress();
@@ -1182,5 +1182,562 @@ describe("Sportsbook", function () {
  
   });
 
+  describe("Edge Cases: Truncation and Small Pools", function () {
+    it("Edge Case 1: Many winners with small pool - truncation to zero", async function () {
+      const { fp1155, sportsbook, admin, users } = await setupContracts();
+      const [user1, user2, user3, user4, user5] = users.slice(0, 5);
+      
+      // Create season with 1 fight
+      const seasonId = 1n;
+      const seasonTokenId = 1n;
+      const latestBlock = await ethers.provider.getBlock("latest");
+      const cutOffTime = BigInt(latestBlock!.timestamp) + 86400n;
+      
+      const fightConfigs = [{
+        minBet: 1n,
+        maxBet: 100n,
+        numOutcomes: 6,
+      }];
+      
+      // Very small prize pool: 1 FP
+      const fightPrizePoolAmounts = [1n];
+      const totalPrizePool = 1n;
+      
+      // Mint initial prize pool + extra for seeding (we'll calculate how much we need)
+      // Start with enough for initial prize pool + potential seed (e.g., 10 FP should be enough)
+      const adminInitialBalance = 10n;
+      await fp1155.mint(admin.address, seasonTokenId, adminInitialBalance, "0x");
+      await fp1155.setTransferAllowlist(admin.address, true);
+      await fp1155.connect(admin).setApprovalForAll(await sportsbook.getAddress(), true);
+      
+      await sportsbook.createSeasonWithFights(
+        seasonId,
+        cutOffTime,
+        seasonTokenId,
+        fightConfigs,
+        fightPrizePoolAmounts
+      );
+      
+      // 5 users bet 1 FP each on the same winning outcome
+      const userBalance = 10n;
+      for (const user of [user1, user2, user3, user4, user5]) {
+        await fp1155.mint(user.address, seasonTokenId, userBalance, "0x");
+        await fp1155.setTransferAllowlist(user.address, true);
+        await fp1155.connect(user).setApprovalForAll(await sportsbook.getAddress(), true);
+      }
+      
+      // All users bet 1 FP on outcome 0 (Fighter A, Submission)
+      for (const user of [user1, user2, user3, user4, user5]) {
+        await sportsbook.connect(user).lockPredictionsBatch(
+          seasonId,
+          [0n],
+          [0n],
+          [1n]
+        );
+      }
+      
+      // Get fight statistics
+      const [fighterAUsers, fighterBUsers, fighterAStaked, fighterBStaked, totalUsers, fighterAProb, fighterBProb] = 
+        await (sportsbook as any).getFightStatistics(seasonId, 0);
+      
+      console.log("\n=== FIGHT STATISTICS ===");
+      console.log(`Fighter A: ${fighterAUsers} users, ${formatFP(fighterAStaked)} staked (${(Number(fighterAProb) / 100).toFixed(2)}%)`);
+      console.log(`Fighter B: ${fighterBUsers} users, ${formatFP(fighterBStaked)} staked (${(Number(fighterBProb) / 100).toFixed(2)}%)`);
+      console.log(`Total Users: ${totalUsers}`);
+      
+      // Calculate required seed BEFORE resolution
+      const winningOutcomes = [0];
+      const [requiredPrizePools, currentPrizePools, additionalSeedsNeeded, estimatedWinnersArray] = 
+        await (sportsbook as any).calculateRequiredSeedForSeason(seasonId, winningOutcomes);
+      
+      console.log("\n=== PRE-RESOLUTION SEED CALCULATION ===");
+      console.log(`Fight 0:`);
+      console.log(`  Current Prize Pool: ${formatFP(currentPrizePools[0])}`);
+      console.log(`  Required Prize Pool: ${formatFP(requiredPrizePools[0])}`);
+      console.log(`  Additional Seed Needed: ${formatFP(additionalSeedsNeeded[0])}`);
+      console.log(`  Winning Users: ${estimatedWinnersArray[0]} (from fighterAUsers: ${fighterAUsers})`);
+      console.log(`  Problem: Pool (${formatFP(currentPrizePools[0])}) < Required (${formatFP(requiredPrizePools[0])})`);
+      console.log(`  Solution: Need to seed ${formatFP(additionalSeedsNeeded[0])} more FP`);
+      
+      // Declare variables for use after seeding
+      let currentPrizePoolsAfter: bigint[] = currentPrizePools;
+      let additionalSeedsNeededAfter: bigint[] = additionalSeedsNeeded;
+      
+      // Seed the prize pool if needed
+      if (additionalSeedsNeeded[0] > 0n) {
+        console.log(`\n=== SEEDING PRIZE POOL ===`);
+        const adminBalanceBefore = await fp1155.balanceOf(admin.address, seasonTokenId);
+        const contractBalanceBeforeSeed = await fp1155.balanceOf(await sportsbook.getAddress(), seasonTokenId);
+        
+        console.log(`Admin balance before: ${formatFP(adminBalanceBefore)}`);
+        console.log(`Contract balance before: ${formatFP(contractBalanceBeforeSeed)}`);
+        console.log(`Seeding ${formatFP(additionalSeedsNeeded[0])} FP...`);
+        
+        // Seed the prize pool with autoSeed = true
+        await sportsbook.connect(admin).seedPrizePoolsForSeason(seasonId, winningOutcomes, true);
+        
+        const adminBalanceAfter = await fp1155.balanceOf(admin.address, seasonTokenId);
+        const contractBalanceAfterSeed = await fp1155.balanceOf(await sportsbook.getAddress(), seasonTokenId);
+        
+        console.log(`Admin balance after: ${formatFP(adminBalanceAfter)}`);
+        console.log(`Contract balance after: ${formatFP(contractBalanceAfterSeed)}`);
+        console.log(`Admin paid: ${formatFP(adminBalanceBefore - adminBalanceAfter)}`);
+        console.log(`Contract received: ${formatFP(contractBalanceAfterSeed - contractBalanceBeforeSeed)}`);
+        
+        // Verify the seed was applied
+        const [requiredPrizePoolsAfter, currentPrizePoolsAfterTemp, additionalSeedsNeededAfterTemp, estimatedWinnersArrayAfter] = 
+          await (sportsbook as any).calculateRequiredSeedForSeason(seasonId, winningOutcomes);
+        
+        currentPrizePoolsAfter = currentPrizePoolsAfterTemp;
+        additionalSeedsNeededAfter = additionalSeedsNeededAfterTemp;
+        
+        console.log(`\n=== VERIFICATION AFTER SEEDING ===`);
+        console.log(`Fight 0:`);
+        console.log(`  Current Prize Pool: ${formatFP(currentPrizePoolsAfter[0])} (was ${formatFP(currentPrizePools[0])})`);
+        console.log(`  Required Prize Pool: ${formatFP(requiredPrizePoolsAfter[0])}`);
+        console.log(`  Additional Seed Needed: ${formatFP(additionalSeedsNeededAfter[0])} (was ${formatFP(additionalSeedsNeeded[0])})`);
+        
+        expect(currentPrizePoolsAfter[0]).to.equal(currentPrizePools[0] + additionalSeedsNeeded[0]);
+        expect(additionalSeedsNeededAfter[0]).to.equal(0n);
+      }
+      
+      // Resolve: outcome 0 wins
+      await sportsbook.connect(admin).resolveSeason(seasonId, winningOutcomes);
+      
+      const sportsbookAddress = await sportsbook.getAddress();
+      
+      // Check balances BEFORE claims
+ 
+      const balancesBefore: bigint[] = [];
+      for (let i = 0; i < 5; i++) {
+        const user = [user1, user2, user3, user4, user5][i];
+        const balance = await fp1155.balanceOf(user.address, seasonTokenId);
+        balancesBefore.push(balance); 
+      }
+      const contractBalanceBefore = await fp1155.balanceOf(sportsbookAddress, seasonTokenId); 
+      
+      // Get fight resolution data to see actual prize pool after seed
+      const [totalWinningsPool, winningPoolTotalShares, winningOutcome] = 
+        await sportsbook.getFightResolutionData(seasonId, 0);
+      
+      // Check winnings for each user
+      console.log("\n=== EDGE CASE 1: Many winners with small pool (AFTER SEEDING) ===");
+      console.log(`Initial Prize Pool: ${formatFP(1n)} FP`);
+      console.log(`Seeded Prize Pool: ${formatFP(additionalSeedsNeeded[0])} FP`);
+      console.log(`Final Prize Pool: ${formatFP(currentPrizePoolsAfter[0])} FP`);
+      console.log(`Total Stakes: ${formatFP(5n)} FP (5 users × 1 FP each)`);
+      console.log(`\nAfter Resolution:`);
+      console.log(`  Total Winnings Pool: ${formatFP(totalWinningsPool)} (${formatFP(currentPrizePoolsAfter[0])} FP prize pool + 0 loser stakes)`);
+      console.log(`  Winning Pool Total Shares: ${formatFP(winningPoolTotalShares)} (5 users × 4 shares each)`);
+      const expectedWinningsPerUser = (totalWinningsPool * 4n) / winningPoolTotalShares;
+      console.log(`  Expected winnings per user: (${formatFP(totalWinningsPool)} × 4) / ${formatFP(winningPoolTotalShares)} = ${formatFP(expectedWinningsPerUser)} FP`);
+      console.log(`  ✅ All winners will receive at least 1 FP!`);
+      
+      // Get winnings info for each user
+      const userWinningsInfo: Array<{user: any, points: bigint, winnings: bigint, totalPayout: bigint}> = [];
+      for (let i = 0; i < 5; i++) {
+        const user = [user1, user2, user3, user4, user5][i];
+        const [canClaim, userPoints, userWinnings, totalPayout, claimed] = 
+          await sportsbook.getPositionWinnings(user.address, seasonId, 0);
+        
+        userWinningsInfo.push({user, points: userPoints, winnings: userWinnings, totalPayout});
+        
+        // User should be able to claim (correct winner)
+        expect(canClaim).to.be.true;
+        expect(userPoints).to.equal(4n); // Exact match
+        // Winnings should be at least 1 FP after seeding
+        expect(userWinnings).to.be.gte(1n);
+        // User should receive stake + winnings
+        expect(totalPayout).to.be.gte(2n); // At least 1 stake + 1 winnings
+      }
+      
+      // Users claim their winnings
+      console.log("\n=== USERS CLAIM WINNINGS ===");
+      let totalPayouts = 0n;
+      for (let i = 0; i < 5; i++) {
+        const user = [user1, user2, user3, user4, user5][i];
+        const info = userWinningsInfo[i];
+        
+        const balanceBeforeClaim = await fp1155.balanceOf(user.address, seasonTokenId);
+        const contractBalanceBeforeClaim = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+        
+        await expect(sportsbook.connect(user).claim(seasonId))
+          .to.emit(sportsbook, "Claimed");
+        
+        const balanceAfterClaim = await fp1155.balanceOf(user.address, seasonTokenId);
+        const contractBalanceAfterClaim = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+        const received = balanceAfterClaim - balanceBeforeClaim;
+        const contractPaid = contractBalanceBeforeClaim - contractBalanceAfterClaim;
+        
+        totalPayouts += info.totalPayout;
+        
+        console.log(`\nUser${i + 1} claim:`);
+        console.log(`  Balance before: ${formatFP(balanceBeforeClaim)}`);
+        console.log(`  Balance after: ${formatFP(balanceAfterClaim)}`);
+        console.log(`  Received: ${formatFP(received)} (${formatFP(info.winnings)} winnings + ${formatFP(1n)} stake)`);
+        console.log(`  Contract paid: ${formatFP(contractPaid)}`);
+        
+        expect(balanceAfterClaim).to.equal(balanceBeforeClaim + info.totalPayout);
+        expect(contractPaid).to.equal(info.totalPayout);
+      }
+      
+      // Final balances
+      console.log("\n=== FINAL BALANCES ===");
+      for (let i = 0; i < 5; i++) {
+        const user = [user1, user2, user3, user4, user5][i];
+        const balanceAfter = await fp1155.balanceOf(user.address, seasonTokenId);
+        const balanceBefore = balancesBefore[i];
+        const received = balanceAfter - balanceBefore;
+        console.log(`User${i + 1}: ${formatFP(balanceBefore)} → ${formatFP(balanceAfter)} (received: ${formatFP(received)})`);
+      }
+      const contractBalanceFinal = await fp1155.balanceOf(sportsbookAddress, seasonTokenId);
+      console.log(`Sportsbook contract balance: ${formatFP(contractBalanceBefore)} → ${formatFP(contractBalanceFinal)}`);
+      console.log(`Total payouts: ${formatFP(totalPayouts)} (5 users × ${formatFP(totalPayouts / 5n)} FP each)`);
+      console.log(`Remainder in contract: ${formatFP(contractBalanceFinal)} FP`);
+      console.log(`\n💡 Explanation:`);
+      console.log(`  - Initial: ${formatFP(contractBalanceBefore)} FP (${formatFP(currentPrizePoolsAfter[0])} prize pool + 5 stakes)`);
+      console.log(`  - Paid out: ${formatFP(totalPayouts)} FP (stakes + winnings)`);
+      console.log(`  - Remainder: ${formatFP(contractBalanceFinal)} FP (residual from distribution)`);
+      console.log(`  - ✅ All winners received winnings thanks to seeding!`);
+      
+      expect(contractBalanceFinal).to.equal(contractBalanceBefore - totalPayouts);
+    });
+
+    it("Edge Case 2: One winner with large pool", async function () {
+      const { fp1155, sportsbook, admin, users } = await setupContracts();
+      const [user1] = users;
+      const sportsbookAddress = await sportsbook.getAddress();
+      
+      const seasonId = 2n;
+      const seasonTokenId = 1n;
+      const latestBlock = await ethers.provider.getBlock("latest");
+      const cutOffTime = BigInt(latestBlock!.timestamp) + 86400n;
+      
+      const fightConfigs = [{
+        minBet: 1n,
+        maxBet: 1000n,
+        numOutcomes: 6,
+      }];
+      
+      // Large prize pool: 1000 FP
+      const fightPrizePoolAmounts = [1000n];
+      const totalPrizePool = 1000n;
+      
+      await fp1155.mint(admin.address, seasonTokenId, totalPrizePool, "0x");
+      await fp1155.setTransferAllowlist(admin.address, true);
+      await fp1155.connect(admin).setApprovalForAll(await sportsbook.getAddress(), true);
+      
+      await sportsbook.createSeasonWithFights(
+        seasonId,
+        cutOffTime,
+        seasonTokenId,
+        fightConfigs,
+        fightPrizePoolAmounts
+      );
+      
+      // Single user bets 1 FP
+      await fp1155.mint(user1.address, seasonTokenId, 10n, "0x");
+      await fp1155.setTransferAllowlist(user1.address, true);
+      await fp1155.connect(user1).setApprovalForAll(await sportsbook.getAddress(), true);
+      
+      await sportsbook.connect(user1).lockPredictionsBatch(
+        seasonId,
+        [0n],
+        [0n],
+        [1n]
+      );
+      
+      // Calculate required seed BEFORE resolution
+      const winningOutcomes = [0];
+      const [requiredPrizePools, currentPrizePools, additionalSeedsNeeded, estimatedWinnersArray] = 
+        await (sportsbook as any).calculateRequiredSeedForSeason(seasonId, winningOutcomes);
+      
+      console.log("\n=== PRE-RESOLUTION SEED CALCULATION ===");
+      console.log(`Fight 0:`);
+      console.log(`  Current Prize Pool: ${formatFP(currentPrizePools[0])}`);
+      console.log(`  Required Prize Pool: ${formatFP(requiredPrizePools[0])}`);
+      console.log(`  Additional Seed Needed: ${formatFP(additionalSeedsNeeded[0])}`);
+      console.log(`  Estimated Winners: ${estimatedWinnersArray[0]}`);
+      console.log(`  Status: Pool is sufficient (no additional seed needed)`);
+      
+      // Resolve: outcome 0 wins
+      await sportsbook.connect(admin).resolveSeason(seasonId, winningOutcomes);
+      
+      const [canClaim, userPoints, userWinnings, totalPayout, claimed] = 
+        await sportsbook.getPositionWinnings(user1.address, seasonId, 0);
+      
+      console.log("\n=== EDGE CASE 2: One winner with large pool ===");
+      console.log(`Total Winnings Pool: ${formatFP(1000n)}`);
+      console.log(`Winning Pool Total Shares: ${formatFP(4n)} (1 user × 4 shares)`);
+      console.log(`Expected winnings: (1000 × 4) / 4 = 1000 FP`);
+      
+      expect(canClaim).to.be.true;
+      expect(userPoints).to.equal(4n);
+      expect(userWinnings).to.equal(1000n);
+      expect(totalPayout).to.equal(1001n); // 1 stake + 1000 winnings
+    });
+
+    it("Edge Case 3: Many winners with different stakes", async function () {
+      const { fp1155, sportsbook, admin, users } = await setupContracts();
+      const [user1, user2, user3, user4, user5] = users.slice(0, 5);
+      const sportsbookAddress = await sportsbook.getAddress();
+      
+      const seasonId = 3n;
+      const seasonTokenId = 1n;
+      const latestBlock = await ethers.provider.getBlock("latest");
+      const cutOffTime = BigInt(latestBlock!.timestamp) + 86400n;
+      
+      const fightConfigs = [{
+        minBet: 1n,
+        maxBet: 1000n,
+        numOutcomes: 6,
+      }];
+      
+      // Small prize pool: 10 FP
+      const fightPrizePoolAmounts = [10n];
+      const totalPrizePool = 10n;
+      
+      await fp1155.mint(admin.address, seasonTokenId, totalPrizePool, "0x");
+      await fp1155.setTransferAllowlist(admin.address, true);
+      await fp1155.connect(admin).setApprovalForAll(await sportsbook.getAddress(), true);
+      
+      await sportsbook.createSeasonWithFights(
+        seasonId,
+        cutOffTime,
+        seasonTokenId,
+        fightConfigs,
+        fightPrizePoolAmounts
+      );
+      
+      // Setup users
+      for (const user of [user1, user2, user3, user4, user5]) {
+        await fp1155.mint(user.address, seasonTokenId, 1000n, "0x");
+        await fp1155.setTransferAllowlist(user.address, true);
+        await fp1155.connect(user).setApprovalForAll(await sportsbook.getAddress(), true);
+      }
+      
+      // 4 users bet 1 FP each, 1 user bets 100 FP
+      await sportsbook.connect(user1).lockPredictionsBatch(seasonId, [0n], [0n], [1n]);
+      await sportsbook.connect(user2).lockPredictionsBatch(seasonId, [0n], [0n], [1n]);
+      await sportsbook.connect(user3).lockPredictionsBatch(seasonId, [0n], [0n], [1n]);
+      await sportsbook.connect(user4).lockPredictionsBatch(seasonId, [0n], [0n], [1n]);
+      await sportsbook.connect(user5).lockPredictionsBatch(seasonId, [0n], [0n], [100n]);
+      
+      // Calculate required seed BEFORE resolution
+      const winningOutcomes = [0];
+      const [requiredPrizePools, currentPrizePools, additionalSeedsNeeded, estimatedWinnersArray] = 
+        await (sportsbook as any).calculateRequiredSeedForSeason(seasonId, winningOutcomes);
+      
+      console.log("\n=== PRE-RESOLUTION SEED CALCULATION ===");
+      console.log(`Fight 0:`);
+      console.log(`  Current Prize Pool: ${formatFP(currentPrizePools[0])}`);
+      console.log(`  Required Prize Pool: ${formatFP(requiredPrizePools[0])}`);
+      console.log(`  Additional Seed Needed: ${formatFP(additionalSeedsNeeded[0])}`);
+      console.log(`  Estimated Winners: ${estimatedWinnersArray[0]}`);
+      console.log(`  Problem: Pool (${formatFP(currentPrizePools[0])}) < Required (${formatFP(requiredPrizePools[0])})`);
+      console.log(`  Solution: Need to seed ${formatFP(additionalSeedsNeeded[0])} more FP`);
+      console.log(`  Impact: Small stake users (1 FP) will get 0 winnings due to truncation`);
+      
+      // Resolve: outcome 0 wins
+      await sportsbook.connect(admin).resolveSeason(seasonId, winningOutcomes);
+      
+      console.log("\n=== EDGE CASE 3: Many winners with different stakes ===");
+      console.log(`Total Winnings Pool: ${formatFP(10n)} (10 FP prize pool + 0 loser stakes)`);
+      console.log(`Winning Pool Total Shares: ${formatFP(412n)} (4 users × 4 shares + 1 user × 400 shares)`);
+      
+      // Check small stake users (1 FP each)
+      for (let i = 0; i < 4; i++) {
+        const user = [user1, user2, user3, user4][i];
+        const [canClaim, userPoints, userWinnings, totalPayout, claimed] = 
+          await sportsbook.getPositionWinnings(user.address, seasonId, 0);
+        
+        console.log(`\nUser${i + 1} (1 FP stake):`);
+        console.log(`  Winnings: ${formatFP(userWinnings)}`);
+        console.log(`  Total Payout: ${formatFP(totalPayout)}`);
+        
+        expect(canClaim).to.be.true;
+        expect(userPoints).to.equal(4n);
+        // (10 * 4) / 412 = 40 / 412 = 0 (truncated)
+        expect(userWinnings).to.equal(0n);
+        expect(totalPayout).to.equal(1n); // Only stake recovered
+      }
+      
+      // Check large stake user (100 FP)
+      const [canClaim5, userPoints5, userWinnings5, totalPayout5, claimed5] = 
+        await sportsbook.getPositionWinnings(user5.address, seasonId, 0);
+      
+      console.log(`\nUser5 (100 FP stake):`);
+      console.log(`  Winnings: ${formatFP(userWinnings5)}`);
+      console.log(`  Total Payout: ${formatFP(totalPayout5)}`);
+      
+      expect(canClaim5).to.be.true;
+      expect(userPoints5).to.equal(4n);
+      // (10 * 400) / 412 = 4000 / 412 = 9 FP (truncated, should be 9.708...)
+      expect(userWinnings5).to.equal(9n);
+      expect(totalPayout5).to.equal(109n); // 100 stake + 9 winnings
+    });
+
+    it("Edge Case 4: Pool exactly equals shares (no truncation)", async function () {
+      const { fp1155, sportsbook, admin, users } = await setupContracts();
+      const [user1, user2, user3, user4, user5] = users.slice(0, 5);
+      const sportsbookAddress = await sportsbook.getAddress();
+      
+      const seasonId = 4n;
+      const seasonTokenId = 1n;
+      const latestBlock = await ethers.provider.getBlock("latest");
+      const cutOffTime = BigInt(latestBlock!.timestamp) + 86400n;
+      
+      const fightConfigs = [{
+        minBet: 1n,
+        maxBet: 1000n,
+        numOutcomes: 6,
+      }];
+      
+      // Prize pool: 20 FP (exactly equals 5 users × 4 shares)
+      const fightPrizePoolAmounts = [20n];
+      const totalPrizePool = 20n;
+      
+      await fp1155.mint(admin.address, seasonTokenId, totalPrizePool, "0x");
+      await fp1155.setTransferAllowlist(admin.address, true);
+      await fp1155.connect(admin).setApprovalForAll(await sportsbook.getAddress(), true);
+      
+      await sportsbook.createSeasonWithFights(
+        seasonId,
+        cutOffTime,
+        seasonTokenId,
+        fightConfigs,
+        fightPrizePoolAmounts
+      );
+      
+      // 5 users bet 1 FP each
+      for (const user of [user1, user2, user3, user4, user5]) {
+        await fp1155.mint(user.address, seasonTokenId, 10n, "0x");
+        await fp1155.setTransferAllowlist(user.address, true);
+        await fp1155.connect(user).setApprovalForAll(await sportsbook.getAddress(), true);
+        await sportsbook.connect(user).lockPredictionsBatch(seasonId, [0n], [0n], [1n]);
+      }
+      
+      // Calculate required seed BEFORE resolution
+      const winningOutcomes = [0];
+      const [requiredPrizePools, currentPrizePools, additionalSeedsNeeded, estimatedWinnersArray] = 
+        await (sportsbook as any).calculateRequiredSeedForSeason(seasonId, winningOutcomes);
+      
+      console.log("\n=== PRE-RESOLUTION SEED CALCULATION ===");
+      console.log(`Fight 0:`);
+      console.log(`  Current Prize Pool: ${formatFP(currentPrizePools[0])}`);
+      console.log(`  Required Prize Pool: ${formatFP(requiredPrizePools[0])}`);
+      console.log(`  Additional Seed Needed: ${formatFP(additionalSeedsNeeded[0])}`);
+      console.log(`  Estimated Winners: ${estimatedWinnersArray[0]}`);
+      console.log(`  Status: Pool is sufficient (no additional seed needed)`);
+      
+      // Resolve: outcome 0 wins
+      await sportsbook.connect(admin).resolveSeason(seasonId, winningOutcomes);
+      
+      console.log("\n=== EDGE CASE 4: Pool exactly equals shares ===");
+      console.log(`Total Winnings Pool: ${formatFP(20n)}`);
+      console.log(`Winning Pool Total Shares: ${formatFP(20n)} (5 users × 4 shares)`);
+      console.log(`Expected winnings per user: (20 × 4) / 20 = 4 FP`);
+      
+      for (let i = 0; i < 5; i++) {
+        const user = [user1, user2, user3, user4, user5][i];
+        const [canClaim, userPoints, userWinnings, totalPayout, claimed] = 
+          await sportsbook.getPositionWinnings(user.address, seasonId, 0);
+        
+        expect(canClaim).to.be.true;
+        expect(userPoints).to.equal(4n);
+        expect(userWinnings).to.equal(4n); // Perfect division, no truncation
+        expect(totalPayout).to.equal(5n); // 1 stake + 4 winnings
+      }
+    });
+
+    it("Edge Case 5: Pool smaller than shares (severe truncation)", async function () {
+      const { fp1155, sportsbook, admin, users } = await setupContracts();
+      const [user1, user2, user3, user4, user5, user6, user7, user8, user9, user10] = users.slice(0, 10);
+      const sportsbookAddress = await sportsbook.getAddress();
+      
+      const seasonId = 5n;
+      const seasonTokenId = 1n;
+      const latestBlock = await ethers.provider.getBlock("latest");
+      const cutOffTime = BigInt(latestBlock!.timestamp) + 86400n;
+      
+      const fightConfigs = [{
+        minBet: 1n,
+        maxBet: 1000n,
+        numOutcomes: 6,
+      }];
+      
+      // Very small prize pool: 1 FP
+      const fightPrizePoolAmounts = [1n];
+      const totalPrizePool = 1n;
+      
+      await fp1155.mint(admin.address, seasonTokenId, totalPrizePool, "0x");
+      await fp1155.setTransferAllowlist(admin.address, true);
+      await fp1155.connect(admin).setApprovalForAll(await sportsbook.getAddress(), true);
+      
+      await sportsbook.createSeasonWithFights(
+        seasonId,
+        cutOffTime,
+        seasonTokenId,
+        fightConfigs,
+        fightPrizePoolAmounts
+      );
+      
+      // 10 users bet 1 FP each
+      const allUsers = [user1, user2, user3, user4, user5, user6, user7, user8, user9, user10];
+      for (const user of allUsers) {
+        await fp1155.mint(user.address, seasonTokenId, 10n, "0x");
+        await fp1155.setTransferAllowlist(user.address, true);
+        await fp1155.connect(user).setApprovalForAll(await sportsbook.getAddress(), true);
+        await sportsbook.connect(user).lockPredictionsBatch(seasonId, [0n], [0n], [1n]);
+      }
+      
+      // Calculate required seed BEFORE resolution
+      const winningOutcomes = [0];
+      const [requiredPrizePools, currentPrizePools, additionalSeedsNeeded, estimatedWinnersArray] = 
+        await (sportsbook as any).calculateRequiredSeedForSeason(seasonId, winningOutcomes);
+      
+      console.log("\n=== PRE-RESOLUTION SEED CALCULATION ===");
+      console.log(`Fight 0:`);
+      console.log(`  Current Prize Pool: ${formatFP(currentPrizePools[0])}`);
+      console.log(`  Required Prize Pool: ${formatFP(requiredPrizePools[0])}`);
+      console.log(`  Additional Seed Needed: ${formatFP(additionalSeedsNeeded[0])}`);
+      console.log(`  Estimated Winners: ${estimatedWinnersArray[0]}`);
+      console.log(`  Problem: Pool (${formatFP(currentPrizePools[0])}) < Required (${formatFP(requiredPrizePools[0])})`);
+      console.log(`  Solution: Need to seed ${formatFP(additionalSeedsNeeded[0])} more FP`);
+      console.log(`  Impact: All users will get 0 winnings due to truncation`);
+      
+      // Resolve: outcome 0 wins
+      await sportsbook.connect(admin).resolveSeason(seasonId, winningOutcomes);
+      
+      console.log("\n=== EDGE CASE 5: Pool smaller than shares ===");
+      console.log(`Total Winnings Pool: ${formatFP(1n)}`);
+      console.log(`Winning Pool Total Shares: ${formatFP(40n)} (10 users × 4 shares)`);
+      console.log(`Expected winnings per user: (1 × 4) / 40 = 0 FP (truncated)`);
+      console.log(`Problem: Only first user to claim will get the 1 FP, others get 0`);
+      
+      // First user claims
+      const balanceBefore1 = await fp1155.balanceOf(user1.address, seasonTokenId);
+      await sportsbook.connect(user1).claim(seasonId);
+      const balanceAfter1 = await fp1155.balanceOf(user1.address, seasonTokenId);
+      const winnings1 = balanceAfter1 - balanceBefore1;
+      
+      console.log(`\nUser1 claim: ${formatFP(winnings1)}`);
+      
+      // Check remaining users
+      for (let i = 1; i < 10; i++) {
+        const user = allUsers[i];
+        const [canClaim, userPoints, userWinnings, totalPayout, claimed] = 
+          await sportsbook.getPositionWinnings(user.address, seasonId, 0);
+        
+        console.log(`User${i + 1}: winnings=${formatFP(userWinnings)}, total=${formatFP(totalPayout)}`);
+        
+        expect(canClaim).to.be.true;
+        expect(userPoints).to.equal(4n);
+        // After first user claimed, pool might be 0, so others get 0 winnings
+        expect(userWinnings).to.equal(0n);
+        expect(totalPayout).to.equal(1n); // Only stake recovered
+      }
+    });
+  });
 
 });
